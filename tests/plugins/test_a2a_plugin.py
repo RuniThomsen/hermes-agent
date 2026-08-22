@@ -309,6 +309,15 @@ class TestAgentCardV1:
         assert card["security"] == [{"bearer": []}]
         assert card["securitySchemes"]["bearer"]["scheme"] == "bearer"
 
+    def test_card_declares_task_metadata_extension(self):
+        card = protocol.build_agent_card(name="x", url="u", description="d")
+
+        assert card["capabilities"]["extensions"] == [{
+            "uri": "https://runi.services/a2a/ext/task/v1",
+            "description": "Task metadata using schema.org Action vocabulary.",
+            "required": False,
+        }]
+
     def test_skills_from_toolset_names(self):
         skills = protocol.skills_from_toolsets(["web", "terminal"])
         ids = {s["id"] for s in skills}
@@ -359,6 +368,32 @@ class TestV1Parts:
     def test_extract_text_from_params(self):
         params = {"message": protocol.text_message(protocol.ROLE_USER, "do X")}
         assert protocol.extract_text(params) == "do X"
+
+    def test_render_message_for_session_includes_generic_metadata(self):
+        params = {"message": {
+            **protocol.text_message(protocol.ROLE_USER, "do X"),
+            "metadata": {
+                "example.org/a2a/ext/task/v1/task": {
+                    "name": "Review release",
+                    "priority": 3,
+                },
+            },
+        }}
+
+        rendered = protocol.render_message_for_session(params)
+
+        assert rendered.startswith("do X\n\n[A2A message metadata]\n")
+        assert '"example.org/a2a/ext/task/v1/task"' in rendered
+        assert '"name": "Review release"' in rendered
+        assert '"priority": 3' in rendered
+
+    def test_render_message_for_session_ignores_non_object_metadata(self):
+        params = {"message": {
+            **protocol.text_message(protocol.ROLE_USER, "do X"),
+            "metadata": "not-an-object",
+        }}
+
+        assert protocol.render_message_for_session(params) == "do X"
 
     def test_extract_text_tolerates_v03_parts(self):
         msg = {"role": "user", "parts": [{"kind": "text", "text": "legacy 0.3"}]}
@@ -1141,6 +1176,30 @@ class TestInboundRoundTrip:
 
         asyncio.run(run())
 
+    def test_live_server_passes_message_metadata_into_agent_session(self, monkeypatch):
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+        adapter, base = _make_live_adapter(monkeypatch)
+        extension_key = "example.org/a2a/ext/task/v1/task"
+
+        async def run():
+            assert await adapter.connect() is True
+            body = _send_body("quote the task name")
+            body["params"]["message"]["metadata"] = {
+                extension_key: {"name": "Metadata reached Hermes"},
+            }
+
+            resp = await asyncio.to_thread(_post_json, base + "/", body)
+            reply = protocol.extract_text(resp["result"]["artifacts"][0])
+
+            assert "quote the task name" in reply
+            assert "[A2A message metadata]" in reply
+            assert extension_key in reply
+            assert "Metadata reached Hermes" in reply
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
     def test_mixed_parts_delivered_to_agent(self, monkeypatch):
         """A message with text + file + data Parts delivers all content to the
         agent — file URLs and data JSON are rendered into the text stream."""
@@ -1536,16 +1595,23 @@ class TestMultiAgentRouting:
             assert agent_arg["slug"] == "dev"
             assert peer == "peer-x"
             assert "hello" in framed_text
+            assert "[A2A message metadata]" in framed_text
+            assert "example.org/a2a/ext/task/v1/task" in framed_text
+            assert "Routed metadata reached Hermes" in framed_text
             time.sleep(0.5)
             return "dev reply", protocol.STATE_COMPLETED
 
         adapter._forward_to_profile = fake_forward  # type: ignore
+        message = protocol.text_message(protocol.ROLE_USER, "hello", context_id="ctx-dev")
+        message["metadata"] = {
+            "example.org/a2a/ext/task/v1/task": {
+                "name": "Routed metadata reached Hermes",
+            },
+        }
         started = time.monotonic()
         response = adapter._rpc_message_send(
             "receipt",
-            {"tenant": "dev", "message": protocol.text_message(
-                protocol.ROLE_USER, "hello", context_id="ctx-dev"
-            )},
+            {"tenant": "dev", "message": message},
             "peer-x",
             agent=agent,
         )
