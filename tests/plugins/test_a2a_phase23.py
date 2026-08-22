@@ -171,8 +171,10 @@ class TestStreamingEndToEnd:
 
         async def run():
             assert await adapter.connect() is True
+            body = _send_body("stream me", method="message/stream")
+            body["params"]["message"]["referenceTaskIds"] = ["board:789", "board:727"]
             payloads, events = await asyncio.to_thread(
-                _post_sse, base + "/", _send_body("stream me", method="message/stream"))
+                _post_sse, base + "/", body)
 
             # Discrimination is by member name; every payload is a StreamResponse.
             # v1.0 streaming begins with the current Task (or a direct Message),
@@ -182,6 +184,8 @@ class TestStreamingEndToEnd:
                 assert "kind" not in json.dumps(p)
             assert "task" in payloads[0]
             assert payloads[0]["task"]["status"]["state"] == "TASK_STATE_SUBMITTED"
+            assert payloads[0]["task"]["history"][0]["referenceTaskIds"] == ["board:789", "board:727"]
+            assert payloads[0]["task"]["history"][0]["taskId"] == payloads[0]["task"]["id"]
 
             states = [p["statusUpdate"]["status"]["state"]
                       for p in payloads if "statusUpdate" in p]

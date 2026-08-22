@@ -574,6 +574,31 @@ metrics = Metrics()
 # Task store — pending AND completed tasks (queryable via tasks/get, tasks/list)
 # --------------------------------------------------------------------------
 
+_MESSAGE_PROTO_FIELDS = frozenset({
+    "messageId", "contextId", "taskId", "role", "parts", "metadata",
+    "extensions", "referenceTaskIds",
+})
+
+
+def task_history_message(message: Any, task_id: str, context_id: str) -> Optional[dict]:
+    """Build the receiver-owned Message record stored under ``Task.history``.
+
+    Preserve the A2A Message correlation and task-tree fields while dropping
+    caller-only keys that strict ProtoJSON clients would reject.  The returned
+    copy is receiver-owned; the inbound request object is never mutated.
+    """
+    if not isinstance(message, dict):
+        return None
+    out = {
+        key: copy.deepcopy(value)
+        for key, value in message.items()
+        if key in _MESSAGE_PROTO_FIELDS
+    }
+    out["taskId"] = task_id
+    out["contextId"] = context_id
+    return out
+
+
 class TaskStore:
     """In-memory store of A2A tasks, kept after completion for tasks/get.
 
@@ -598,7 +623,9 @@ class TaskStore:
         return True
 
     def create(self, task_id: str, context_id: str, peer: str,
-               agent_slug: str = "", tenant: str = "") -> dict:
+               agent_slug: str = "", tenant: str = "",
+               message: Optional[dict] = None) -> dict:
+        history_message = task_history_message(message, task_id, context_id)
         rec = {
             "task_id": task_id,
             "context_id": context_id,
@@ -611,6 +638,7 @@ class TaskStore:
             "created_iso": now_iso(),
             "push_url": "",
             "push_config_id": "",
+            "history": [history_message] if history_message is not None else [],
         }
         with self._lock:
             self._tasks[task_id] = rec
@@ -793,6 +821,11 @@ class TaskStore:
             task.pop("artifacts", None)
         if history_length == 0:
             task.pop("history", None)
+        elif rec.get("history"):
+            history = rec["history"]
+            if history_length is not None:
+                history = history[-max(0, int(history_length)):]
+            task["history"] = copy.deepcopy(history)
         return copy.deepcopy(task)
 
 # --------------------------------------------------------------------------

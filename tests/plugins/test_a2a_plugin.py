@@ -458,6 +458,39 @@ class TestV1Parts:
 
 
 class TestV1Task:
+    def test_receiver_task_writeback_keeps_inbound_message_as_history_child(self):
+        store = protocol.TaskStore()
+        inbound = {
+            "messageId": "msg-dispatch-727",
+            "contextId": "ctx-session-685",
+            "role": protocol.ROLE_USER,
+            "parts": [protocol.text_part("Prove one visible child row")],
+            "extensions": ["https://runi.services/a2a/ext/task/v1"],
+            "referenceTaskIds": ["board:789", "board:727"],
+            "metadata": {
+                "runi.services/a2a/ext/task/v1/task": {
+                    "name": "Live task-tree child proof",
+                    "actionType": "AssignAction",
+                },
+            },
+            "callerOnly": "must not leak into the Task ProtoJSON record",
+        }
+
+        store.create(
+            "task-receiver-727", "ctx-session-685", "abel",
+            message=inbound,
+        )
+        record = store.get("task-receiver-727")
+        assert record is not None
+        task = protocol.TaskStore.to_task(record)
+
+        expected = {key: value for key, value in inbound.items() if key != "callerOnly"}
+        assert task["history"] == [{
+            **expected,
+            "taskId": "task-receiver-727",
+        }]
+        assert "taskId" not in inbound
+
     def test_completed_task_shape(self):
         task = protocol.build_task("t1", "c1", protocol.STATE_COMPLETED, "the answer")
         assert task["status"]["state"] == "TASK_STATE_COMPLETED"
@@ -1552,11 +1585,13 @@ class TestMultiAgentRouting:
 
         adapter._forward_to_profile = fake_forward  # type: ignore
         started = time.monotonic()
+        message = protocol.text_message(
+            protocol.ROLE_USER, "hello", context_id="ctx-dev"
+        )
+        message["referenceTaskIds"] = ["board:789", "board:727"]
         response = adapter._rpc_message_send(
             "receipt",
-            {"tenant": "dev", "message": protocol.text_message(
-                protocol.ROLE_USER, "hello", context_id="ctx-dev"
-            )},
+            {"tenant": "dev", "message": message},
             "peer-x",
             agent=agent,
         )
@@ -1565,6 +1600,8 @@ class TestMultiAgentRouting:
 
         assert elapsed < 0.25
         assert receipt["status"]["state"] == protocol.STATE_WORKING
+        assert receipt["history"][0]["referenceTaskIds"] == ["board:789", "board:727"]
+        assert receipt["history"][0]["taskId"] == receipt["id"]
         deadline = time.monotonic() + 2
         task = receipt
         while time.monotonic() < deadline:
