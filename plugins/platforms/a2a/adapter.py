@@ -762,7 +762,10 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.persist_message(context_id, "user", text, task_id)
         protocol.metrics.inbound_total += 1
 
-        rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+        rec = self.tasks.create(
+            task_id, context_id, peer, *self._scope_for_agent(agent),
+            message=params.get("message") if isinstance(params.get("message"), dict) else None,
+        )
         self._register_inline_push(task_id, params, agent=agent)
 
         if not agent.get("local", True):
@@ -1016,10 +1019,9 @@ class A2AAdapter(BasePlatformAdapter):
             name=f"a2a-send-{pending['task_id']}",
             daemon=True,
         ).start()
-        task = protocol.build_task(
-            pending["task_id"], pending["context_id"], protocol.STATE_WORKING,
-            created_at=pending["created_iso"],
-        )
+        rec = self.tasks.get(pending["task_id"], *self._scope_for_agent(agent))
+        assert rec is not None
+        task = protocol.TaskStore.to_task(rec)
         result = protocol.send_message_response(task) if v1_response else task
         return protocol.jsonrpc_result(req_id, result)
 
@@ -1074,9 +1076,15 @@ class A2AAdapter(BasePlatformAdapter):
                 return
 
             task_id, context_id = pending["task_id"], pending["context_id"]
-            self._sse_write(handler, protocol.sse_data(protocol.stream_task(
-                protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])),
-                req_id))
+            rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
+            assert rec is not None
+            initial_task = protocol.TaskStore.to_task(rec)
+            initial_task["status"] = {
+                "state": protocol.STATE_SUBMITTED,
+                "timestamp": protocol.now_iso(),
+            }
+            self._sse_write(handler, protocol.sse_data(
+                protocol.stream_task(initial_task), req_id))
             self._sse_write(handler, protocol.sse_data(
                 protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
 
