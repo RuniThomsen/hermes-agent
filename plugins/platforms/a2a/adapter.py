@@ -702,6 +702,7 @@ class A2AAdapter(BasePlatformAdapter):
         """
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
+        session_text = protocol.render_message_for_session(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
         task_id = protocol.new_task_id()
 
@@ -729,7 +730,7 @@ class A2AAdapter(BasePlatformAdapter):
                 "Empty task — nothing to do.", created_at=rec["created_iso"],
             ), None
 
-        framed = security.wrap_inbound(peer, text)
+        framed = security.wrap_inbound(peer, session_text)
         security.audit("inbound", peer, task_id, text)
         protocol.persist_message(context_id, "user", text, task_id)
         protocol.metrics.inbound_total += 1

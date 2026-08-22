@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 PROTOCOL_VERSION = "1.0"
+TASK_METADATA_EXTENSION_URI = "https://runi.services/a2a/ext/task/v1"
 
 # A2A v1.0 task lifecycle states.
 STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
@@ -131,6 +132,11 @@ def build_agent_card(
             "pushNotifications": push_notifications,
             "stateTransitionHistory": False,
             "extendedAgentCard": False,
+            "extensions": [{
+                "uri": TASK_METADATA_EXTENSION_URI,
+                "description": "Task metadata using schema.org Action vocabulary.",
+                "required": False,
+            }],
         },
         "defaultInputModes": ["text/plain"],
         "defaultOutputModes": ["text/plain"],
@@ -353,6 +359,27 @@ def extract_text(message_or_params: dict) -> str:
             chunks.append(f"[data]\n{rendered}")
             continue
     return "\n".join(chunks).strip()
+
+
+def render_message_for_session(message_or_params: dict) -> str:
+    """Render Message parts and generic Message metadata for the agent session.
+
+    A2A extensions place their values under URI-namespaced ``metadata`` keys.
+    Keep the adapter extension-agnostic: any JSON object is rendered verbatim
+    beside the Parts instead of teaching Hermes a vendor-specific schema.
+    """
+    text = extract_text(message_or_params)
+    msg = message_or_params.get("message", message_or_params)
+    metadata = msg.get("metadata") if isinstance(msg, dict) else None
+    if not isinstance(metadata, dict) or not metadata:
+        return text
+    try:
+        rendered_metadata = json.dumps(
+            metadata, ensure_ascii=False, indent=2, sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        return text
+    return f"{text}\n\n[A2A message metadata]\n{rendered_metadata}".strip()
 
 
 def extract_context_id(params: dict) -> str:
