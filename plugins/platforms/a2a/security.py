@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -75,6 +76,17 @@ def _parse_bearer(auth_header: Optional[str]) -> Optional[str]:
     return parts[1].strip()
 
 
+def _tokenless_loopback_allowed(client_ip: str) -> bool:
+    """Whether an explicitly configured legacy loopback call may omit auth."""
+    enabled = os.getenv("A2A_PEER_TOKENS_OPTIONAL_ON_LOOPBACK", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return False
+    try:
+        return ipaddress.ip_address(client_ip).is_loopback
+    except ValueError:
+        return False
+
+
 def authenticate(auth_header: Optional[str], client_ip: str = "") -> Optional[str]:
     """Authenticate an inbound request; return the peer identity or None.
 
@@ -90,6 +102,8 @@ def authenticate(auth_header: Optional[str], client_ip: str = "") -> Optional[st
     if not peer_tokens and not shared:
         return f"ip:{client_ip or 'local'}"
     presented = _parse_bearer(auth_header)
+    if presented is None and peer_tokens and _tokenless_loopback_allowed(client_ip):
+        return f"ip:{client_ip}"
     if presented is None:
         return None
     for token, name in peer_tokens.items():

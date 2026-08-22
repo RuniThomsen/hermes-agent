@@ -167,6 +167,17 @@ class TestPeerIdentity:
         assert security.authenticate(None, "1.2.3.4") is None
         assert security.authenticate("Basic tok-a", "1.2.3.4") is None
 
+    def test_optional_loopback_peer_tokens_preserve_tokenless_loopback(self, monkeypatch):
+        monkeypatch.setenv("A2A_PEER_TOKENS", "abel:tok-abel")
+        monkeypatch.setenv("A2A_PEER_TOKENS_OPTIONAL_ON_LOOPBACK", "1")
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+
+        assert security.authenticate(None, "127.0.0.1") == "ip:127.0.0.1"
+        assert security.authenticate(None, "::1") == "ip:::1"
+        assert security.authenticate("Bearer tok-abel", "127.0.0.1") == "abel"
+        assert security.authenticate("Bearer wrong", "127.0.0.1") is None
+        assert security.authenticate(None, "10.10.1.5") is None
+
     def test_shared_token_identity_is_ip(self, monkeypatch):
         monkeypatch.setenv("A2A_BEARER_TOKEN", "shared-tok")
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
