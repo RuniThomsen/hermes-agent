@@ -766,17 +766,34 @@ class A2AAdapter(BasePlatformAdapter):
         self._register_inline_push(task_id, params, agent=agent)
 
         if not agent.get("local", True):
-            reply, state = self._forward_to_profile(agent, peer, context_id, framed)
-            self.tasks.complete(task_id, state, reply)
-            protocol.persist_message(context_id, "agent", reply, task_id)
-            security.audit("outbound", peer, task_id, reply)
-            if state == protocol.STATE_COMPLETED:
-                protocol.metrics.outbound_total += 1
-                protocol.metrics.tasks_completed += 1
-            else:
-                protocol.metrics.tasks_failed += 1
-            self._send_push_notification(task_id, context_id, reply, state)
-            return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+            fut = self._add_pending(task_id, context_id)
+            pending = {
+                "task_id": task_id,
+                "context_id": context_id,
+                "peer": peer,
+                "future": fut,
+                "created_iso": rec["created_iso"],
+                "started": time.time(),
+            }
+
+            def forward() -> None:
+                try:
+                    reply, state = self._forward_to_profile(
+                        agent, peer, context_id, framed
+                    )
+                except Exception as e:
+                    reply = security.redact_outbound(f"Profile dispatch failed: {e}")
+                    state = protocol.STATE_FAILED
+                if not fut.done():
+                    fut.set_result((state, reply))
+
+            self.tasks.set_state(task_id, protocol.STATE_WORKING)
+            threading.Thread(
+                target=forward,
+                name=f"a2a-forward-{task_id}",
+                daemon=True,
+            ).start()
+            return None, pending
 
         if self._loop is None or self._message_handler is None:
             self.tasks.complete(task_id, protocol.STATE_FAILED, "")
@@ -977,14 +994,30 @@ class A2AAdapter(BasePlatformAdapter):
                 return (protocol.STATE_FAILED, "[agent did not reply in time]")
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
+        """Dispatch once and return the task receipt without holding the RPC.
+
+        Completion is recorded when the gateway resolves the pending future;
+        callers that want to wait observe the same task with GetTask.  Keeping
+        SendMessage non-holding avoids issuing the task id only after the agent
+        has already completed and avoids an abandoned SSE wait path.
+        """
         terminal, pending = self._prepare_task(params, peer, agent=agent)
         if terminal is not None:
             result = protocol.send_message_response(terminal) if v1_response else terminal
             return protocol.jsonrpc_result(req_id, result)
-        state, reply = self._await_reply(pending)
-        state, reply = self._finalize_task(pending, state, reply)
+        assert pending is not None
+
+        def finalize() -> None:
+            state, reply = self._await_reply(pending)
+            self._finalize_task(pending, state, reply)
+
+        threading.Thread(
+            target=finalize,
+            name=f"a2a-send-{pending['task_id']}",
+            daemon=True,
+        ).start()
         task = protocol.build_task(
-            pending["task_id"], pending["context_id"], state, reply,
+            pending["task_id"], pending["context_id"], protocol.STATE_WORKING,
             created_at=pending["created_iso"],
         )
         result = protocol.send_message_response(task) if v1_response else task

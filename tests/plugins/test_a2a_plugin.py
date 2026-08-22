@@ -1011,6 +1011,24 @@ def _post_json(url, body, headers=None):
         return json.loads(r.read().decode())
 
 
+def _poll_task(base, task_id, *, headers=None, method="tasks/get", timeout=3):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = _post_json(base + "/", {
+            "jsonrpc": "2.0", "id": "poll", "method": method,
+            "params": {"taskId": task_id},
+        }, headers)
+        task = response["result"]
+        if task["status"]["state"] in {
+            *protocol.TERMINAL_STATES,
+            protocol.STATE_INPUT_REQUIRED,
+            protocol.STATE_AUTH_REQUIRED,
+        }:
+            return task
+        time.sleep(0.02)
+    raise AssertionError(f"task {task_id} did not reach a terminal state")
+
+
 def _send_body(text, ctx="", extra_params=None):
     msg = protocol.text_message(protocol.ROLE_USER, text, context_id=ctx)
     params = {"message": msg}
@@ -1021,6 +1039,65 @@ def _send_body(text, ctx="", extra_params=None):
 
 @pytest.mark.integration
 class TestInboundRoundTrip:
+    def test_send_message_returns_task_receipt_before_completion_and_get_task_polls(self, monkeypatch):
+        """SendMessage must issue a task id without holding for the agent reply;
+        GetTask is the completion-observation path."""
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+
+        adapter, base = _make_live_adapter(monkeypatch, reply_fn=lambda _event: None)
+
+        async def delayed_handle(event):
+            await asyncio.sleep(0.5)
+            await adapter.send(
+                event.source.chat_id,
+                "ECHO: " + event.text,
+                metadata={"notify": True},
+            )
+
+        adapter.handle_message = delayed_handle  # type: ignore
+
+        async def run():
+            assert await adapter.connect() is True
+            started = time.monotonic()
+            send_resp = await asyncio.to_thread(_post_json, base + "/", {
+                "jsonrpc": "2.0", "id": "receipt", "method": "SendMessage",
+                "params": {
+                    "message": protocol.text_message(
+                        protocol.ROLE_USER, "slow agent", context_id="ctx-receipt"
+                    ),
+                    "configuration": {"blocking": False},
+                },
+            }, {"A2A-Version": "1.0"})
+            elapsed = time.monotonic() - started
+
+            receipt = protocol.unwrap_send_message_response(send_resp["result"])
+            assert elapsed < 0.25
+            assert receipt["id"]
+            assert receipt["status"]["state"] == protocol.STATE_WORKING
+
+            states = []
+            task = None
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                get_resp = await asyncio.to_thread(_post_json, base + "/", {
+                    "jsonrpc": "2.0", "id": "poll", "method": "GetTask",
+                    "params": {"taskId": receipt["id"]},
+                }, {"A2A-Version": "1.0"})
+                task = get_resp["result"]
+                states.append(task["status"]["state"])
+                if task["status"]["state"] == protocol.STATE_COMPLETED:
+                    break
+                await asyncio.sleep(0.02)
+
+            assert states[0] == protocol.STATE_WORKING
+            assert states[-1] == protocol.STATE_COMPLETED
+            assert task is not None
+            assert "slow agent" in protocol.extract_text(task["artifacts"][0])
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
     def test_live_server_card_and_message_send(self, monkeypatch):
         """Start the real adapter server, hit the Agent Card, then send a task
         and verify the mocked agent's reply comes back as a v1.0 Task."""
@@ -1038,8 +1115,9 @@ class TestInboundRoundTrip:
 
             resp = await asyncio.to_thread(_post_json, base + "/", _send_body("hello agent"))
             assert resp["id"] == "1"
-            task = resp["result"]
-            assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+            receipt = resp["result"]
+            assert receipt["status"]["state"] == protocol.STATE_WORKING
+            task = await asyncio.to_thread(_poll_task, base, receipt["id"])
             reply = protocol.extract_text(task["artifacts"][0])
             assert "ECHO:" in reply
             assert "hello agent" in reply  # framed text still contains the task
@@ -1093,7 +1171,10 @@ class TestInboundRoundTrip:
                 "jsonrpc": "2.0", "id": "1", "method": "message/send",
                 "params": {"message": msg},
             })
-            assert resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
+            receipt = resp["result"]
+            assert receipt["status"]["state"] == protocol.STATE_WORKING
+            task = await asyncio.to_thread(_poll_task, base, receipt["id"])
+            assert task["status"]["state"] == protocol.STATE_COMPLETED
             # The agent received all three parts rendered into text
             assert "Please process these:" in received["text"]
             assert "https://example.com/report.pdf" in received["text"]
@@ -1184,7 +1265,8 @@ class TestInboundRoundTrip:
         async def run():
             assert await adapter.connect() is True
             resp = await asyncio.to_thread(_post_json, base + "/", _send_body("review the code"))
-            task = resp["result"]
+            receipt = resp["result"]
+            task = await asyncio.to_thread(_poll_task, base, receipt["id"])
             assert task["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
             question = protocol.extract_text(task["status"]["message"])
             assert "Which repository" in question
@@ -1207,7 +1289,9 @@ class TestInboundRoundTrip:
             failed_before = protocol.metrics.tasks_failed
             completed_before = protocol.metrics.tasks_completed
             resp = await asyncio.to_thread(_post_json, base + "/", _send_body("are you there"))
-            task = resp["result"]
+            receipt = resp["result"]
+            assert receipt["status"]["state"] == protocol.STATE_WORKING
+            task = await asyncio.to_thread(_poll_task, base, receipt["id"], timeout=2)
             assert task["status"]["state"] == "TASK_STATE_FAILED"
             assert protocol.metrics.tasks_failed == failed_before + 1
             assert protocol.metrics.tasks_completed == completed_before
@@ -1257,7 +1341,12 @@ class TestInboundRoundTrip:
             resp = await asyncio.to_thread(
                 _post_json, base + "/", _send_body("hello"),
                 {"Authorization": "Bearer topsecret"})
-            assert resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
+            receipt = resp["result"]
+            task = await asyncio.to_thread(
+                _poll_task, base, receipt["id"],
+                headers={"Authorization": "Bearer topsecret"},
+            )
+            assert task["status"]["state"] == protocol.STATE_COMPLETED
 
             await adapter.disconnect()
 
@@ -1286,7 +1375,12 @@ class TestInboundRoundTrip:
             body["params"]["peer"] = "the-operator"
             resp = await asyncio.to_thread(
                 _post_json, base + "/", body, {"Authorization": "Bearer tok-alice"})
-            assert resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
+            receipt = resp["result"]
+            task = await asyncio.to_thread(
+                _poll_task, base, receipt["id"],
+                headers={"Authorization": "Bearer tok-alice"},
+            )
+            assert task["status"]["state"] == protocol.STATE_COMPLETED
             assert seen["user"] == "alice"
             assert "'alice'" in seen["text"]
             assert "the-operator" not in seen["text"]
@@ -1341,8 +1435,10 @@ class TestPushNotificationEndToEnd:
                 },
             })
             resp = await asyncio.to_thread(_post_json, base + "/", body)
-            task = resp["result"]
-            assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+            receipt = resp["result"]
+            assert receipt["status"]["state"] == protocol.STATE_WORKING
+            task = await asyncio.to_thread(_poll_task, base, receipt["id"])
+            assert task["status"]["state"] == protocol.STATE_COMPLETED
 
             assert received_evt.wait(timeout=5), "push callback never received"
             payload = received["body"]
@@ -1427,7 +1523,7 @@ class TestMultiAgentRouting:
         route = adapter._route_for_request("/dev/", {"tenant": "research"})
         assert "error" in route
 
-    def test_forwarded_profile_task_completes_in_task_store(self, monkeypatch):
+    def test_forwarded_profile_send_returns_receipt_before_task_completes(self, monkeypatch):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
 
@@ -1440,18 +1536,36 @@ class TestMultiAgentRouting:
             assert agent_arg["slug"] == "dev"
             assert peer == "peer-x"
             assert "hello" in framed_text
+            time.sleep(0.5)
             return "dev reply", protocol.STATE_COMPLETED
 
         adapter._forward_to_profile = fake_forward  # type: ignore
-        terminal, pending = adapter._prepare_task(
-            {"tenant": "dev", "message": protocol.text_message(protocol.ROLE_USER, "hello", context_id="ctx-dev")},
+        started = time.monotonic()
+        response = adapter._rpc_message_send(
+            "receipt",
+            {"tenant": "dev", "message": protocol.text_message(
+                protocol.ROLE_USER, "hello", context_id="ctx-dev"
+            )},
             "peer-x",
             agent=agent,
         )
-        assert pending is None
-        assert terminal["status"]["state"] == protocol.STATE_COMPLETED
-        assert protocol.extract_text(terminal["artifacts"][0]) == "dev reply"
-        assert adapter.tasks.get(terminal["id"])["state"] == protocol.STATE_COMPLETED
+        elapsed = time.monotonic() - started
+        receipt = response["result"]
+
+        assert elapsed < 0.25
+        assert receipt["status"]["state"] == protocol.STATE_WORKING
+        deadline = time.monotonic() + 2
+        task = receipt
+        while time.monotonic() < deadline:
+            task = adapter._rpc_tasks_get("poll", {"taskId": receipt["id"]}, agent=agent)["result"]
+            if task["status"]["state"] == protocol.STATE_COMPLETED:
+                break
+            time.sleep(0.02)
+        assert task["status"]["state"] == protocol.STATE_COMPLETED
+        assert protocol.extract_text(task["artifacts"][0]) == "dev reply"
+        record = adapter.tasks.get(receipt["id"], "dev", "dev")
+        assert record is not None
+        assert record["state"] == protocol.STATE_COMPLETED
 
 
 class TestClientTenantAndDiscovery:
@@ -1513,8 +1627,12 @@ class TestV1SpecRegressionFixes:
             resp = await asyncio.to_thread(_post_json, base + "/", body, {"A2A-Version": "1.0"})
             assert resp["id"] == "1"
             assert set(resp["result"].keys()) == {"task"}
-            task = resp["result"]["task"]
-            assert task["status"]["state"] == protocol.STATE_COMPLETED
+            receipt = resp["result"]["task"]
+            assert receipt["status"]["state"] == protocol.STATE_WORKING
+            task = await asyncio.to_thread(
+                _poll_task, base, receipt["id"],
+                headers={"A2A-Version": "1.0"}, method="GetTask",
+            )
             assert "hello v1" in protocol.extract_text(task["artifacts"][0])
             get_resp = await asyncio.to_thread(_post_json, base + "/", {
                 "jsonrpc": "2.0", "id": "2", "method": "GetTask",
