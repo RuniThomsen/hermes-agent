@@ -327,7 +327,7 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
     # Show metrics snapshot
     m = protocol.metrics.snapshot()
     lines.append("")
-    lines.append(f"Metrics: {m['inbound_total']} in / {m['outbound_total']} out, "
+    lines.append(f"Metrics: {m['inbound_total']} in ({m.get('inbound_polls', 0)} polls) / {m['outbound_total']} out, "
                  f"{m['tasks_completed']} completed, {m['tasks_failed']} failed, "
                  f"{m['streams_started']} streams, {m['push_sent']} push sent, "
                  f"{m['anti_loop_triggers']} anti-loop, {m['rate_limit_triggers']} rate-limited, "

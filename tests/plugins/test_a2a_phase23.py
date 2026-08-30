@@ -398,6 +398,63 @@ class TestRateLimiting:
 
         asyncio.run(run())
 
+    def test_poll_operations_are_not_send_limited(self):
+        assert protocol.operation_rate_limited("get") is False
+        assert protocol.operation_rate_limited("list") is False
+        assert protocol.operation_rate_limited("push_get") is False
+        assert protocol.operation_rate_limited("send") is True
+        assert protocol.operation_rate_limited("stream") is True
+        assert protocol.operation_rate_limited(None) is True
+
+    @pytest.mark.integration
+    def test_panel_polls_exempt_from_send_limit_and_count_inbound(self, monkeypatch):
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+        monkeypatch.setenv("A2A_RATE_LIMIT", "2")
+        adapter, base = _make_live_adapter(monkeypatch)
+        protocol.metrics.inbound_polls = 0
+        protocol.metrics.inbound_total = 0
+        protocol.metrics.rate_limit_triggers = 0
+
+        async def run():
+            assert await adapter.connect() is True
+
+            def _poll_burst():
+                codes = []
+                for _ in range(5):
+                    try:
+                        _post_json(base + "/", {
+                            "jsonrpc": "2.0", "id": "1", "method": "tasks/get",
+                            "params": {"id": "task-missing"},
+                        })
+                        codes.append(200)
+                    except urllib.error.HTTPError as e:
+                        codes.append(e.code)
+                return codes
+
+            codes = await asyncio.to_thread(_poll_burst)
+            assert codes == [200, 200, 200, 200, 200]
+            assert protocol.metrics.inbound_polls >= 5
+            assert protocol.metrics.inbound_total >= 5
+            assert protocol.metrics.rate_limit_triggers == 0
+
+            def _send_burst():
+                send_codes = []
+                for _ in range(3):
+                    try:
+                        _post_json(base + "/", _send_body("hi"))
+                        send_codes.append(200)
+                    except urllib.error.HTTPError as e:
+                        send_codes.append(e.code)
+                return send_codes
+
+            send_codes = await asyncio.to_thread(_send_burst)
+            assert send_codes[:2] == [200, 200]
+            assert send_codes[2] == 429
+            await adapter.disconnect()
+
+        asyncio.run(run())
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Metrics
@@ -407,7 +464,7 @@ class TestRateLimiting:
 class TestMetrics:
     def test_metrics_snapshot_has_fields(self):
         m = protocol.metrics.snapshot()
-        for field in ("uptime_seconds", "inbound_total", "outbound_total",
+        for field in ("uptime_seconds", "inbound_total", "inbound_polls", "outbound_total",
                       "streams_started", "push_sent", "push_failed",
                       "tasks_completed", "tasks_failed", "anti_loop_triggers",
                       "rate_limit_triggers", "avg_latency_ms"):
