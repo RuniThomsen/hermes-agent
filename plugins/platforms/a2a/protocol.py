@@ -491,6 +491,20 @@ class TurnTracker:
 _RATE_LIMIT_DEFAULT = 60  # requests per minute
 _RATE_WINDOW = 60.0  # seconds
 
+# Read-only panel polls must not consume the same per-identity budget as
+# messages and task mutations. A detached UI publisher can poll faster than
+# 60/minute; sharing that bucket starves the agent's actual caller seat.
+_POLL_OPS = frozenset({"get", "list", "push_get", "push_list"})
+
+
+def operation_is_poll(operation: Optional[str]) -> bool:
+    return operation in _POLL_OPS
+
+
+def operation_rate_limited(operation: Optional[str]) -> bool:
+    """Rate-limit every operation except the bounded read-only poll set."""
+    return not operation_is_poll(operation)
+
 
 def _rate_limit_per_minute() -> int:
     try:
@@ -530,6 +544,7 @@ class Metrics:
 
     def __init__(self) -> None:
         self.inbound_total = 0
+        self.inbound_polls = 0
         self.outbound_total = 0
         self.streams_started = 0
         self.push_sent = 0
@@ -555,6 +570,7 @@ class Metrics:
         return {
             "uptime_seconds": round(uptime, 1),
             "inbound_total": self.inbound_total,
+            "inbound_polls": self.inbound_polls,
             "outbound_total": self.outbound_total,
             "streams_started": self.streams_started,
             "push_sent": self.push_sent,

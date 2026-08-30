@@ -295,10 +295,14 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return
         agent = route["agent"]
 
-        if not adapter._rate_limiter.allow(identity):
-            protocol.metrics.rate_limit_triggers += 1
-            self._json(429, protocol.jsonrpc_error(req_id, protocol.ERR_RATE_LIMITED, "rate limit exceeded"))
-            return
+        if protocol.operation_is_poll(operation):
+            protocol.metrics.inbound_polls += 1
+            protocol.metrics.inbound_total += 1
+        elif protocol.operation_rate_limited(operation):
+            if not adapter._rate_limiter.allow(identity):
+                protocol.metrics.rate_limit_triggers += 1
+                self._json(429, protocol.jsonrpc_error(req_id, protocol.ERR_RATE_LIMITED, "rate limit exceeded"))
+                return
 
         if not security.is_trusted_peer(identity):
             self._json(403, protocol.jsonrpc_error(
