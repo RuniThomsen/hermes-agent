@@ -1255,6 +1255,7 @@ class TeamsAdapter(BasePlatformAdapter):
                         success=False,
                         error=error,
                         retryable=False,
+                        delivery_ambiguous=True,
                     )
             except Exception as e:
                 return SendResult(success=False, error=str(e), retryable=True)

@@ -411,12 +411,16 @@ class TestTeamsSend:
         mock_app.send = AsyncMock(return_value=SimpleNamespace(id=None))
         adapter._app = mock_app
 
-        result = await adapter.send("conv-id", "Hello")
+        result = await adapter._send_with_retry(
+            "conv-id", "Hello", max_retries=0
+        )
 
         assert result.success is False
         assert result.retryable is False
+        assert result.delivery_ambiguous is True
         assert "without activity id" in str(result.error)
         assert "without activity id" in caplog.text
+        mock_app.send.assert_awaited_once_with("conv-id", "Hello")
 
 
 def _make_summary_payload():
