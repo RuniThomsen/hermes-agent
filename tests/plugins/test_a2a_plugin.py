@@ -73,6 +73,81 @@ def test_reply_wait_uses_configured_timeout(monkeypatch):
     assert 890 < future.timeout <= 900
 
 
+def test_stream_return_immediately_does_not_await_reply(monkeypatch):
+    """A2A 1.0 returnImmediately/blocking=false must not hold the stream RPC."""
+    from gateway.config import PlatformConfig
+
+    monkeypatch.delenv("A2A_REPLY_TIMEOUT", raising=False)
+    adapter = a2a_adapter.A2AAdapter(
+        PlatformConfig(enabled=True, extra={"reply_timeout": 5})
+    )
+    task_id = "task-immediate-stream"
+    context_id = "ctx-immediate-stream"
+    future = adapter._add_pending(task_id, context_id)
+    adapter.tasks.create(task_id, context_id, "peer")
+    adapter.tasks.set_state(task_id, protocol.STATE_WORKING)
+    pending = {
+        "task_id": task_id,
+        "context_id": context_id,
+        "peer": "peer",
+        "future": future,
+        "created_iso": protocol.now_iso(),
+        "started": time.time(),
+    }
+    monkeypatch.setattr(adapter, "_prepare_task", lambda *args, **kwargs: (None, pending))
+
+    class _Wfile:
+        def __init__(self):
+            self.chunks: list[bytes] = []
+
+        def write(self, data):
+            self.chunks.append(data if isinstance(data, bytes) else data.encode())
+
+        def flush(self):
+            pass
+
+    class _Handler:
+        def __init__(self):
+            self.wfile = _Wfile()
+            self.close_connection = False
+
+        def send_response(self, *_args, **_kwargs):
+            return None
+
+        def send_header(self, *_args, **_kwargs):
+            return None
+
+        def end_headers(self):
+            return None
+
+    handler = _Handler()
+    params = {
+        "message": {},
+        "configuration": {"blocking": False, "returnImmediately": True},
+    }
+    started = time.monotonic()
+    adapter._rpc_message_stream(handler, "stream-1", params, "peer")
+    elapsed = time.monotonic() - started
+    body = b"".join(handler.wfile.chunks).decode("utf-8", errors="replace")
+    assert elapsed < 1.0, elapsed
+    assert task_id in body
+    assert context_id in body
+    rec = adapter.tasks.get(task_id)
+    assert rec is not None
+    assert rec["state"] == protocol.STATE_WORKING
+    future.set_result((protocol.STATE_COMPLETED, "late stream body"))
+    deadline = time.monotonic() + 1
+    after = adapter.tasks.get(task_id)
+    while time.monotonic() < deadline:
+        after = adapter.tasks.get(task_id)
+        if after and after["state"] == protocol.STATE_COMPLETED:
+            break
+        time.sleep(0.01)
+    assert after is not None
+    assert after["state"] == protocol.STATE_COMPLETED
+    assert after["reply"] == "late stream body"
+
+
 def test_orphan_watchdog_outlives_routed_agent_timeout(monkeypatch):
     from gateway.config import PlatformConfig
 

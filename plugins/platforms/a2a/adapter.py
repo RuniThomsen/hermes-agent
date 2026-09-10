@@ -169,6 +169,22 @@ def _method_info(method: str) -> tuple[str, bool]:
     return mapping.get(method, ("", False))
 
 
+def _wants_immediate_receipt(params: dict) -> bool:
+    """A2A 1.0 non-holding receipt: returnImmediately, or not blocking.
+
+    Default is immediate. A 15s observer must see task/context ids without
+    waiting for the agent turn. Opt in to a held RPC with blocking=true.
+    """
+    cfg = params.get("configuration") if isinstance(params, dict) else None
+    if not isinstance(cfg, dict):
+        cfg = {}
+    if cfg.get("returnImmediately") is True:
+        return True
+    if "blocking" in cfg:
+        return not bool(cfg.get("blocking"))
+    return True
+
+
 class _A2AServer(ThreadingHTTPServer):
     """ThreadingHTTPServer that carries a reference to its adapter."""
 
@@ -1023,6 +1039,18 @@ class A2AAdapter(BasePlatformAdapter):
             name=f"a2a-send-{pending['task_id']}",
             daemon=True,
         ).start()
+        if not _wants_immediate_receipt(params):
+            state, reply = self._await_reply(pending)
+            rec = self.tasks.get(pending["task_id"], *self._scope_for_agent(agent))
+            if rec is None:
+                task = protocol.build_task(
+                    pending["task_id"], pending["context_id"], state, reply,
+                    created_at=pending["created_iso"],
+                )
+            else:
+                task = protocol.TaskStore.to_task(rec)
+            result = protocol.send_message_response(task) if v1_response else task
+            return protocol.jsonrpc_result(req_id, result)
         rec = self.tasks.get(pending["task_id"], *self._scope_for_agent(agent))
         assert rec is not None
         task = protocol.TaskStore.to_task(rec)
@@ -1079,7 +1107,19 @@ class A2AAdapter(BasePlatformAdapter):
                 )
                 return
 
+            assert pending is not None
             task_id, context_id = pending["task_id"], pending["context_id"]
+
+            def finalize() -> None:
+                state, reply = self._await_reply(pending)
+                self._finalize_task(pending, state, reply)
+
+            threading.Thread(
+                target=finalize,
+                name=f"a2a-stream-{task_id}",
+                daemon=True,
+            ).start()
+
             rec = self.tasks.get(task_id, *self._scope_for_agent(agent))
             assert rec is not None
             initial_task = protocol.TaskStore.to_task(rec)
@@ -1092,9 +1132,14 @@ class A2AAdapter(BasePlatformAdapter):
             self._sse_write(handler, protocol.sse_data(
                 protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
 
+            if _wants_immediate_receipt(params):
+                # Close this observation stream. The task stays working;
+                # subscribe / push / tasks/get carry the later terminal state.
+                self._sse_write(handler, protocol.sse_done())
+                return
+
             state, reply = self._await_reply(
                 pending, keepalive=lambda: self._sse_write(handler, ": keepalive\n\n"))
-            state, reply = self._finalize_task(pending, state, reply)
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: stream client disconnected")
