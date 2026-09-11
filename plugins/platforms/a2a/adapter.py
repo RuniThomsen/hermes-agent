@@ -244,8 +244,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
-        # #1406: the SUBMITTED receipt must be on the wire before do_POST posts handle_message onto
-        # the gateway loop (_start_deferred_pending). Explicit, so a buffered wfile can never hold it.
+        # #1406: the SUBMITTED receipt must be on the wire before do_POST starts the turn
+        # (_start_deferred_pending). Explicit, so a buffered wfile can never hold it.
         self.wfile.flush()
 
     def _error(self, http_code: int, req_id: Any, code: int, message: str):
@@ -732,7 +732,9 @@ class A2AAdapter(BasePlatformAdapter):
             with self._context_lock(context_id):
                 reply = self._execute_a2a_turn(pending)
                 if reply is not None:
-                    self._resolve_oldest_for_context(context_id, protocol.STATE_COMPLETED, reply)
+                    self._resolve_task(task_id, protocol.STATE_COMPLETED, reply)
+                elif not pending["future"].done():
+                    self._resolve_task(task_id, protocol.STATE_COMPLETED, "")
         except Exception as e:
             msg = security.redact_outbound(f"Dispatch failed: {e}")
             self._resolve_task(task_id, protocol.STATE_FAILED, msg)

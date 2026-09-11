@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import Future
 
 from gateway.config import PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
@@ -125,7 +124,41 @@ def test_same_context_turns_are_serial():
     time.sleep(0.05)
     assert max_overlap["n"] == 1
     gate.set()
-    first["future"].result(timeout=2)
-    second["future"].result(timeout=2)
+    assert first["future"].result(timeout=2) == (protocol.STATE_COMPLETED, "task-a")
+    assert second["future"].result(timeout=2) == (protocol.STATE_COMPLETED, "task-b")
     assert max_overlap["n"] == 1
+    adapter._runner_executor().shutdown(wait=True)
+
+
+def test_empty_bound_handler_settles_its_own_future():
+    adapter = _adapter()
+
+    async def silent(_event):
+        return None
+
+    adapter._message_handler = silent
+    pending = _pending(adapter, task_id="task-empty", context_id="ctx-empty")
+    adapter._start_pending(pending)
+    assert pending["future"].result(timeout=2) == (protocol.STATE_COMPLETED, "")
+    adapter._runner_executor().shutdown(wait=True)
+
+
+def test_instance_handle_message_runs_without_sync_hook(monkeypatch):
+    adapter = _adapter()
+    marshaled = []
+
+    def boom(*_a, **_k):
+        marshaled.append(True)
+        raise AssertionError("gateway loop must not receive handle_message")
+
+    monkeypatch.setattr(a2a_adapter.asyncio, "run_coroutine_threadsafe", boom)
+
+    async def handle(event):
+        await adapter.send(event.source.chat_id, "from-handle", metadata={"notify": True})
+
+    adapter.handle_message = handle  # type: ignore[method-assign]
+    pending = _pending(adapter, task_id="task-handle", context_id="ctx-handle")
+    adapter._start_pending(pending)
+    assert pending["future"].result(timeout=2) == (protocol.STATE_COMPLETED, "from-handle")
+    assert marshaled == []
     adapter._runner_executor().shutdown(wait=True)
