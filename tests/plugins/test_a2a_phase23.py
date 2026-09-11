@@ -499,6 +499,18 @@ class TestTaskStore:
         # Second sweep does nothing (already terminal).
         assert store.fail_orphans(timeout_seconds=300) == []
 
+    def test_fail_orphans_skips_task_while_session_alive(self):
+        """#1406: age alone must not terminalize a task whose session is still live."""
+        store = protocol.TaskStore()
+        store.create("t-live", "c1", "p")
+        store._tasks["t-live"]["created_at"] = time.time() - 600
+        failed = store.fail_orphans(
+            timeout_seconds=300,
+            timeout_for=lambda rec: float("inf") if rec["task_id"] == "t-live" else 300,
+        )
+        assert failed == []
+        assert store.get("t-live")["state"] == protocol.STATE_SUBMITTED
+
     def test_list_newest_first_with_filters(self):
         store = protocol.TaskStore()
         store.create("t1", "c1", "p")

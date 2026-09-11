@@ -603,9 +603,16 @@ class GatewayStartupMixin:
         config = getattr(self, "config", None)
         if config is not None and not getattr(config, "loop_watchdog", True):
             return
+        # #1406 s727: this LaunchAgent pin runs long A2A/tool turns on the gateway loop.
+        # Default 3 missed probes (~90s) os._exit(75); KeepAlive then respawns with an empty
+        # in-memory A2A task store (governor tasks/get not found; MEASURED never lands). Keep the
+        # selector floor; do not arm the hard-exit watchdog on this pin. Revisit after a pid
+        # holds an hour. config.yaml loop_watchdog:false was the preferred knob (write blocked).
         if getattr(self, "_loop_floor_timer_handle", None) is None:
             with _log_suppressed(logging.DEBUG, "Failed to arm gateway loop floor timer", exc_info=True):
                 self._loop_floor_timer_handle = _arm_loop_floor_timer(loop)
+        logger.warning("#1406: loop-liveness hard-exit watchdog not armed on this pin")
+        return
         watchdog = getattr(self, "_loop_liveness_watchdog", None)
         if watchdog is None or not watchdog.is_alive():
             try:

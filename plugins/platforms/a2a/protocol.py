@@ -14,7 +14,7 @@ from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from gateway.platforms._shared import coerce_port as _coerce_int
 
@@ -35,6 +35,7 @@ INPUT_REQUIRED_MARKER = "[INPUT_REQUIRED]"
 ERR_PARSE, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND = -32700, -32602, -32601
 ERR_TASK_NOT_FOUND, ERR_TASK_NOT_CANCELABLE = -32001, -32002  # A2A spec: TaskNotFoundError / TaskNotCancelableError
 ERR_UNAUTHORIZED, ERR_RATE_LIMITED, ERR_UNTRUSTED_PEER = -32050, -32051, -32052
+ERR_SERVER_BUSY = -32053  # #1406: HTTP worker cap reached; retry later (paired with HTTP 503)
 
 # Anti-loop: max inbound turns per context. A2A_MAX_PINGPONG_TURNS env, capped at 20.
 _DEFAULT_MAX_PINGPONG, _HARD_MAX_PINGPONG = 5, 20
@@ -274,7 +275,8 @@ class Metrics:
     and outbound tools; not persisted)."""
 
     _COUNTERS = ("inbound_total", "outbound_total", "streams_started", "push_sent", "push_failed",
-                 "tasks_completed", "tasks_failed", "anti_loop_triggers", "rate_limit_triggers")
+                 "tasks_completed", "tasks_failed", "anti_loop_triggers", "rate_limit_triggers",
+                 "http_busy_rejects")
 
     def __init__(self) -> None:
         for name in self._COUNTERS:
@@ -306,6 +308,15 @@ class TaskStore:
         self._tasks: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         self._watchers: dict[str, list[Future]] = {}
         self._lock = threading.Lock()
+        # Called OFF the lock with a record copy after every state change (#1406 push on state change).
+        self.on_change: Optional[Callable[[dict], None]] = None
+
+    def _notify(self, rec: Optional[dict]) -> None:
+        if rec is not None and (cb := self.on_change) is not None:
+            try:
+                cb(rec)
+            except Exception:  # a push must never break the task path
+                pass
 
     @staticmethod
     def _in_scope(rec: dict, agent_slug: str = "", tenant: str = "") -> bool:
@@ -330,15 +341,19 @@ class TaskStore:
 
     def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "") -> dict:
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
-               "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
+               "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": "",
+               "seq": 0}  # bumped under the lock on every state change; orders push delivery
         with self._lock:
             self._tasks[task_id] = rec
         return dict(rec)
 
     def set_state(self, task_id: str, state: str) -> None:
+        out = None
         with self._lock:
-            if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES:
-                rec["state"] = state
+            if (rec := self._tasks.get(task_id)) and rec["state"] not in TERMINAL_STATES and rec["state"] != state:
+                rec["state"], rec["seq"] = state, rec.get("seq", 0) + 1
+                out = dict(rec)
+        self._notify(out)
 
     def set_push_config(self, task_id: str, url: str, agent_slug: str = "", tenant: str = "") -> Optional[dict]:
         """Attach a push notification config; returns the stored config or None."""
@@ -363,6 +378,12 @@ class TaskStore:
                 rec["push_url"] = rec["push_config_id"] = ""
             return rec is not None
 
+    def peek_push_url(self, task_id: str) -> str:
+        """The task's push URL without clearing it (A2A 1.0 §3.1.7: config persists until completion)."""
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            return (rec.get("push_url") or "") if rec else ""
+
     def pop_push_url(self, task_id: str) -> str:
         with self._lock:
             rec = self._tasks.get(task_id)
@@ -380,13 +401,14 @@ class TaskStore:
             rec = self._tasks.get(task_id)
             if not rec or rec["state"] in TERMINAL_STATES:
                 return None
-            rec.update(state=state, reply=reply, completed_at=time.time())
+            rec.update(state=state, reply=reply, completed_at=time.time(), seq=rec.get("seq", 0) + 1)
             watchers = self._watchers.pop(task_id, [])
             self._trim_locked()
             out = dict(rec)
         for fut in watchers:
             if not fut.done():
                 fut.set_result((state, reply))
+        self._notify(out)
         return out
 
     def watch(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[Future]:
@@ -414,10 +436,25 @@ class TaskStore:
         next_offset = offset + page_size if offset + page_size < total else 0
         return (page, next_offset, total) if with_total else (page, next_offset)
 
-    def fail_orphans(self, timeout_seconds: int = 300) -> list[str]:
+    def fail_orphans(
+        self,
+        timeout_seconds: int = 300,
+        timeout_for: Optional[Callable[[dict], float]] = None,
+    ) -> list[str]:
         with self._lock:
-            stale = [tid for tid, rec in self._tasks.items()
-                     if rec["state"] not in TERMINAL_STATES and time.time() - rec["created_at"] > timeout_seconds]
+            now = time.time()
+            stale = []
+            for tid, rec in self._tasks.items():
+                if rec["state"] in TERMINAL_STATES:
+                    continue
+                limit = float(timeout_seconds)
+                if timeout_for is not None:
+                    try:
+                        limit = max(limit, float(timeout_for(rec)))
+                    except (TypeError, ValueError):
+                        pass
+                if now - rec["created_at"] > limit:
+                    stale.append(tid)
         return [tid for tid in stale if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]")]
 
     def _trim_locked(self) -> None:
