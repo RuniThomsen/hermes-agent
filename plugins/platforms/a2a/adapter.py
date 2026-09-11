@@ -71,6 +71,14 @@ def _reply_timeout() -> float:
         return 300.0
 
 
+def _max_http_workers() -> int:
+    """Cap on concurrent A2A HTTP handler threads (#1406). Over the cap a connection is answered at once."""
+    try:
+        return max(1, int(os.getenv("A2A_MAX_HTTP_WORKERS", "16")))
+    except (ValueError, TypeError):
+        return 16
+
+
 def _default_agent_name() -> str:
     # Scope-aware: a secondary multiplex profile must not borrow the default profile's A2A_AGENT_NAME.
     name = "" if _profile_scoped() else os.getenv("A2A_AGENT_NAME", "").strip()
@@ -146,6 +154,47 @@ def _state_db(profile: str, sql: str, params: tuple, log_msg: str, *, commit: bo
         return ""
 
 
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a hard cap on live handler threads (#1406: ~160 ``tasks/get`` workers
+    convoyed on ``TaskStore._lock`` and starved the gateway loop). Over the cap the accept thread answers
+    HTTP 503 + JSON-RPC ERR_SERVER_BUSY and closes the socket: no thread is spawned, nothing queues."""
+
+    def __init__(self, server_address, handler_class, max_workers: int = 16):
+        super().__init__(server_address, handler_class)
+        self.max_workers = max(1, int(max_workers))
+        self._worker_slots = threading.BoundedSemaphore(self.max_workers)
+
+    def process_request(self, request, client_address):
+        if not self._worker_slots.acquire(blocking=False):
+            protocol.metrics.http_busy_rejects += 1
+            self._reject_busy(request)
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._worker_slots.release()  # thread never started; give the slot back
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
+
+    @staticmethod
+    def _reject_busy(request) -> None:
+        body = json.dumps(_err(None, protocol.ERR_SERVER_BUSY, "server busy: A2A HTTP worker cap reached")).encode("utf-8")
+        head = ("HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\nRetry-After: 1\r\nConnection: close\r\n\r\n").encode("ascii")
+        with contextlib.suppress(OSError):
+            request.settimeout(0)
+            with contextlib.suppress(BlockingIOError, InterruptedError):
+                request.recv(65536)  # drain what already arrived so close() does not RST the reply away
+            request.settimeout(1.0)
+            request.sendall(head + body)
+
+
 class A2ARequestHandler(BaseHTTPRequestHandler):
     """HTTP handler for the A2A JSON-RPC surface; all state lives on ``self.server.adapter``."""
 
@@ -163,6 +212,9 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+        # #1406: the SUBMITTED receipt must be on the wire before do_POST posts handle_message onto
+        # the gateway loop (_start_deferred_pending). Explicit, so a buffered wfile can never hold it.
+        self.wfile.flush()
 
     def _error(self, http_code: int, req_id: Any, code: int, message: str):
         self._json(http_code, _err(req_id, code, message))
@@ -303,7 +355,8 @@ class A2AAdapter(BasePlatformAdapter):
         # Capture the gateway loop so the HTTP thread can marshal events via run_coroutine_threadsafe.
         self._loop = asyncio.get_running_loop()
         try:
-            self._httpd = ThreadingHTTPServer((self.host, self.port), A2ARequestHandler)
+            self._httpd = _BoundedThreadingHTTPServer((self.host, self.port), A2ARequestHandler,
+                                                      max_workers=_max_http_workers())
         except OSError as e:
             logger.error("A2A: could not bind %s:%s — %s", self.host, self.port, e)
             self._set_fatal_error("bind_failed", f"A2A bind failed: {e}", retryable=True)
@@ -799,6 +852,9 @@ class A2AAdapter(BasePlatformAdapter):
             return
         cfg = conf.get("taskPushNotificationConfig") or conf.get("pushNotificationConfig") or {}
         url = (cfg.get("url") or (cfg.get("pushNotificationConfig") or {}).get("url") or "") if isinstance(cfg, dict) else ""
+        if not url:  # #1406: compat field configuration -> pushNotificationConfig -> url (what Seed sends live)
+            compat = (params.get("configuration") or {}).get("pushNotificationConfig") or {}
+            url = (compat.get("url") or "") if isinstance(compat, dict) else ""
         if url:
             self.tasks.set_push_config(task_id, str(url), *self._scope_for_agent(agent))
 

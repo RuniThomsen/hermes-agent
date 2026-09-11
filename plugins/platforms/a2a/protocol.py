@@ -35,6 +35,7 @@ INPUT_REQUIRED_MARKER = "[INPUT_REQUIRED]"
 ERR_PARSE, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND = -32700, -32602, -32601
 ERR_TASK_NOT_FOUND, ERR_TASK_NOT_CANCELABLE = -32001, -32002  # A2A spec: TaskNotFoundError / TaskNotCancelableError
 ERR_UNAUTHORIZED, ERR_RATE_LIMITED, ERR_UNTRUSTED_PEER = -32050, -32051, -32052
+ERR_SERVER_BUSY = -32053  # #1406: HTTP worker cap reached; retry later (paired with HTTP 503)
 
 # Anti-loop: max inbound turns per context. A2A_MAX_PINGPONG_TURNS env, capped at 20.
 _DEFAULT_MAX_PINGPONG, _HARD_MAX_PINGPONG = 5, 20
@@ -274,7 +275,8 @@ class Metrics:
     and outbound tools; not persisted)."""
 
     _COUNTERS = ("inbound_total", "outbound_total", "streams_started", "push_sent", "push_failed",
-                 "tasks_completed", "tasks_failed", "anti_loop_triggers", "rate_limit_triggers")
+                 "tasks_completed", "tasks_failed", "anti_loop_triggers", "rate_limit_triggers",
+                 "http_busy_rejects")
 
     def __init__(self) -> None:
         for name in self._COUNTERS:
