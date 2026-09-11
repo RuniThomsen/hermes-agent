@@ -1279,12 +1279,15 @@ class TestPushNotificationEndToEnd:
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length", 0))
-                received["body"] = json.loads(self.rfile.read(length).decode())
-                received["signature"] = self.headers.get("X-A2A-Signature", "")
+                body = json.loads(self.rfile.read(length).decode())
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
-                received_evt.set()
+                # #1406: one push per state change; keep the terminal one.
+                if body.get("task", {}).get("status", {}).get("state") == "TASK_STATE_COMPLETED":
+                    received["body"] = body
+                    received["signature"] = self.headers.get("X-A2A-Signature", "")
+                    received_evt.set()
 
         hook_port = _free_port()
         hook_server = HTTPServer(("127.0.0.1", hook_port), _Hook)
@@ -1304,16 +1307,16 @@ class TestPushNotificationEndToEnd:
             })
             resp = await asyncio.to_thread(_post_json, base + "/", body)
             task = resp["result"]
-            assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert task["status"]["state"] == "TASK_STATE_SUBMITTED"  # non-holding receipt (#1406)
 
             assert received_evt.wait(timeout=5), "push callback never received"
             payload = received["body"]
-            # v1.0 push payload is a StreamResponse (statusUpdate member).
-            assert "statusUpdate" in payload
-            su = payload["statusUpdate"]
-            assert su["taskId"] == task["id"]
-            assert su["status"]["state"] == "TASK_STATE_COMPLETED"
-            assert "ECHO:" in protocol.extract_text(su["status"]["message"])
+            # v1.0 push payload is a StreamResponse; #1406 pushes the Task member on every state change.
+            assert set(payload) == {"task"}
+            pushed = payload["task"]
+            assert pushed["id"] == task["id"]
+            assert pushed["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert "ECHO:" in protocol.extract_text(pushed["status"]["message"])
             # HMAC signature verifies against the shared secret.
             expected = hmac.new(
                 b"push-secret-1",
@@ -1532,13 +1535,19 @@ class TestV1SpecRegressionFixes:
             assert resp["id"] == "1"
             assert set(resp["result"].keys()) == {"task"}
             task = resp["result"]["task"]
-            assert task["status"]["state"] == protocol.STATE_COMPLETED
-            assert "hello v1" in protocol.extract_text(task["artifacts"][0])
-            get_resp = await asyncio.to_thread(_post_json, base + "/", {
-                "jsonrpc": "2.0", "id": "2", "method": "GetTask",
-                "params": {"id": task["id"]},
-            }, {"A2A-Version": "1.0"})
+            # #1406: SendMessage is non-holding — the receipt is the SUBMITTED Task; the reply lands later.
+            assert task["status"]["state"] == protocol.STATE_SUBMITTED
+            for _ in range(100):
+                get_resp = await asyncio.to_thread(_post_json, base + "/", {
+                    "jsonrpc": "2.0", "id": "2", "method": "GetTask",
+                    "params": {"id": task["id"]},
+                }, {"A2A-Version": "1.0"})
+                if get_resp["result"]["status"]["state"] == protocol.STATE_COMPLETED:
+                    break
+                await asyncio.sleep(0.02)
             assert get_resp["result"]["id"] == task["id"]
+            assert get_resp["result"]["status"]["state"] == protocol.STATE_COMPLETED
+            assert "hello v1" in protocol.extract_text(get_resp["result"]["artifacts"][0])
             list_resp = await asyncio.to_thread(_post_json, base + "/", {
                 "jsonrpc": "2.0", "id": "3", "method": "ListTasks",
                 "params": {"contextId": task["contextId"], "pageSize": 10},
