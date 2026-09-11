@@ -14,7 +14,7 @@ from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from gateway.platforms._shared import coerce_port as _coerce_int
 
@@ -414,10 +414,25 @@ class TaskStore:
         next_offset = offset + page_size if offset + page_size < total else 0
         return (page, next_offset, total) if with_total else (page, next_offset)
 
-    def fail_orphans(self, timeout_seconds: int = 300) -> list[str]:
+    def fail_orphans(
+        self,
+        timeout_seconds: int = 300,
+        timeout_for: Optional[Callable[[dict], float]] = None,
+    ) -> list[str]:
         with self._lock:
-            stale = [tid for tid, rec in self._tasks.items()
-                     if rec["state"] not in TERMINAL_STATES and time.time() - rec["created_at"] > timeout_seconds]
+            now = time.time()
+            stale = []
+            for tid, rec in self._tasks.items():
+                if rec["state"] in TERMINAL_STATES:
+                    continue
+                limit = float(timeout_seconds)
+                if timeout_for is not None:
+                    try:
+                        limit = max(limit, float(timeout_for(rec)))
+                    except (TypeError, ValueError):
+                        pass
+                if now - rec["created_at"] > limit:
+                    stale.append(tid)
         return [tid for tid in stale if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]")]
 
     def _trim_locked(self) -> None:

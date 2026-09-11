@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PORT = 9900
 _ORPHAN_TIMEOUT, _WATCHDOG_INTERVAL = 300, 60  # seconds: pending task considered orphaned / watchdog period
+_ORPHAN_GRACE = 60  # slack beyond reply/route deadlines
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
 _DEFAULT_DESCRIPTION = "Hermes Agent — a general-purpose agent reachable over A2A."
@@ -237,6 +239,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         agent = route["agent"]
         if handler_name == "_rpc_message_send":
             self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1))
+            adapter._start_deferred_pending()
         elif handler_name == "_rpc_message_stream":
             adapter._rpc_message_stream(self, req_id, params, identity, agent=agent)
         elif handler_name == "_rpc_tasks_subscribe":
@@ -280,6 +283,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._pending: Dict[str, tuple[str, Future]] = {}
         self._pending_order: Dict[str, deque[str]] = {}
         self._pending_lock = threading.Lock()
+        self._tls = threading.local()
 
     @property
     def name(self) -> str:
@@ -330,11 +334,35 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending.clear()
             self._pending_order.clear()
 
+    def _orphan_timeout_for(self, rec: dict) -> float:
+        """Never reap a task while its live reply future is still registered.
+
+        After a process restart no such future exists, so genuinely abandoned
+        records still age out through the normal timeout.
+        """
+        task_id = str(rec.get("task_id") or "")
+        with self._pending_lock:
+            if task_id in self._pending or any(task_id in queue for queue in self._pending_order.values()):
+                return math.inf
+        agent = self._agents.get(str(rec.get("agent_slug") or "")) or {}
+        try:
+            route_timeout = float(agent.get("timeout") or 0)
+        except (TypeError, ValueError):
+            route_timeout = 0
+        return int(max(
+            _ORPHAN_TIMEOUT,
+            _reply_timeout() + _ORPHAN_GRACE,
+            route_timeout + _ORPHAN_GRACE,
+        ))
+
     def _watchdog_loop(self) -> None:
         """Background thread that fails orphaned tasks (keeps them queryable)."""
         while not self._watchdog_stop.wait(_WATCHDOG_INTERVAL):
             try:
-                for tid in self.tasks.fail_orphans(_ORPHAN_TIMEOUT):
+                for tid in self.tasks.fail_orphans(
+                    _ORPHAN_TIMEOUT,
+                    timeout_for=self._orphan_timeout_for,
+                ):
                     logger.warning("A2A: orphaned task %s marked failed (timeout %ds)", tid, _ORPHAN_TIMEOUT)
                     protocol.metrics.tasks_failed += 1
             except Exception:
@@ -522,14 +550,51 @@ class A2AAdapter(BasePlatformAdapter):
         fut = self._add_pending(task_id, context_id)
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
                              source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+        return None, {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut,
+                      "created_iso": rec["created_iso"], "started": time.time(), "event": event}
+
+    def _defer_pending(self, pending: Optional[dict]) -> None:
+        self._tls.pending = pending
+
+    def _start_deferred_pending(self) -> None:
+        pending = getattr(self._tls, "pending", None)
+        self._tls.pending = None
+        if pending is not None:
+            self._start_pending(pending)
+
+    def _start_pending(self, pending: dict) -> None:
+        """Run session work only after the HTTP receipt is on the wire."""
+        task_id = pending["task_id"]
+        event = pending.get("event")
+        if event is None or self._loop is None:
+            msg = "Agent gateway not ready to accept A2A tasks."
+            self._pop_pending(task_id)
+            self.tasks.complete(task_id, protocol.STATE_FAILED, msg)
+            protocol.metrics.tasks_failed += 1
+            return
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
         except Exception as e:
             self._pop_pending(task_id)
             msg = security.redact_outbound(f"Dispatch failed: {e}")
-            return self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
+            self.tasks.complete(task_id, protocol.STATE_FAILED, msg)
+            protocol.metrics.tasks_failed += 1
+            return
         self.tasks.set_state(task_id, protocol.STATE_WORKING)
-        return None, {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut, "created_iso": rec["created_iso"], "started": time.time()}
+
+    def _finalize_when_reply_arrives(self, pending: dict) -> None:
+        """Bind terminal task state to the reply future, never an RPC timer."""
+        future = pending["future"]
+
+        def _on_reply(done: Future) -> None:
+            try:
+                state, text = done.result()
+            except Exception as exc:
+                logger.warning("A2A reply future failed for %s: %s", pending["task_id"], exc)
+                state, text = protocol.STATE_FAILED, f"Agent reply failed: {exc}"
+            self._finalize_task(pending, state, text)
+
+        future.add_done_callback(_on_reply)
 
     def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str) -> tuple[str, str]:
         """Forward a routed task to another local profile via ``hermes chat``. First contact creates a
@@ -617,10 +682,15 @@ class A2AAdapter(BasePlatformAdapter):
                                   (protocol.STATE_FAILED, "[agent did not reply in time]"))
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
-        task, pending = self._prepare_task(params, peer, agent=agent)
-        if task is None:
-            state, reply = self._finalize_task(pending, *self._await_reply(pending))
-            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
+        terminal, pending = self._prepare_task(params, peer, agent=agent)
+        if terminal is not None:
+            return _ok(req_id, protocol.send_message_response(terminal) if v1_response else terminal)
+        assert pending is not None
+        self._finalize_when_reply_arrives(pending)
+        rec = self.tasks.get(pending["task_id"], *self._scope_for_agent(agent))
+        task = protocol.TaskStore.to_task(rec) if rec else protocol.build_task(
+            pending["task_id"], pending["context_id"], protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
+        self._defer_pending(pending)
         return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
 
     @staticmethod
@@ -659,10 +729,12 @@ class A2AAdapter(BasePlatformAdapter):
             if terminal is not None:
                 return self._emit_terminal(handler, terminal["id"], terminal["contextId"], terminal["status"]["state"],
                                            protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}), req_id=req_id)
+            assert pending is not None
             task_id, context_id = pending["task_id"], pending["context_id"]
             submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
             self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
+            self._start_pending(pending)
             state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
