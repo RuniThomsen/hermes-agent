@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import math
@@ -21,10 +22,10 @@ import time
 import urllib.parse
 import urllib.request
 from collections import OrderedDict, deque
-from concurrent.futures import Future, InvalidStateError
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
@@ -372,6 +373,12 @@ class A2AAdapter(BasePlatformAdapter):
         self._pending_order: Dict[str, deque[str]] = {}
         self._pending_lock = threading.Lock()
         self._tls = threading.local()
+        # #1406: A2A turns run on this pool, never via run_coroutine_threadsafe(handle_message).
+        self._turn_executor: Optional[ThreadPoolExecutor] = None
+        self._turn_executor_guard = threading.Lock()
+        self._context_locks: Dict[str, threading.Lock] = {}
+        self._context_locks_guard = threading.Lock()
+        self._sync_conversation: Optional[Callable[[dict], Optional[str]]] = None
 
     @property
     def name(self) -> str:
@@ -388,7 +395,7 @@ class A2AAdapter(BasePlatformAdapter):
         return True
 
     async def connect(self, **_kwargs) -> bool:
-        # Capture the gateway loop so the HTTP thread can marshal events via run_coroutine_threadsafe.
+        # Capture the gateway loop for surfaces that still need it; A2A turns do not marshal onto it.
         self._loop = asyncio.get_running_loop()
         try:
             self._httpd = _BoundedThreadingHTTPServer((self.host, self.port), A2ARequestHandler,
@@ -423,6 +430,11 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending_order.clear()
         for fut in futures:  # outside the lock: done-callbacks re-enter _pop_pending (#1406)
             self._set_future(fut, protocol.STATE_FAILED, "[agent shutting down]")
+        with self._turn_executor_guard:
+            executor = self._turn_executor
+            self._turn_executor = None
+        if executor is not None:
+            executor.shutdown(wait=False)
 
     def _orphan_timeout_for(self, rec: dict) -> float:
         """Never reap a task while its live reply future is still registered.
@@ -665,25 +677,94 @@ class A2AAdapter(BasePlatformAdapter):
         if pending is not None:
             self._start_pending(pending)
 
+    def _runner_executor(self) -> ThreadPoolExecutor:
+        """Lazy turn pool. HTTP workers stay on ThreadingHTTPServer; this pool is turns only."""
+        with self._turn_executor_guard:
+            if self._turn_executor is None:
+                self._turn_executor = ThreadPoolExecutor(
+                    max_workers=_max_http_workers(), thread_name_prefix="a2a-turn")
+            return self._turn_executor
+
+    def _context_lock(self, context_id: str) -> threading.Lock:
+        """Same A2A context is serial; other contexts concurrent. Not an asyncio session Event."""
+        with self._context_locks_guard:
+            return self._context_locks.setdefault(context_id, threading.Lock())
+
     def _start_pending(self, pending: dict) -> None:
         """Run session work only after the HTTP receipt is on the wire."""
         task_id = pending["task_id"]
         event = pending.get("event")
-        if event is None or self._loop is None:
+        if event is None:
             msg = "Agent gateway not ready to accept A2A tasks."
             self._pop_pending(task_id)
             self.tasks.complete(task_id, protocol.STATE_FAILED, msg)
             protocol.metrics.tasks_failed += 1
             return
+        self.tasks.set_state(task_id, protocol.STATE_WORKING)
         try:
-            asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
+            self._runner_executor().submit(self._run_a2a_turn_sync, pending)
         except Exception as e:
             self._pop_pending(task_id)
             msg = security.redact_outbound(f"Dispatch failed: {e}")
             self.tasks.complete(task_id, protocol.STATE_FAILED, msg)
             protocol.metrics.tasks_failed += 1
-            return
-        self.tasks.set_state(task_id, protocol.STATE_WORKING)
+
+    def _run_a2a_turn_sync(self, pending: dict) -> None:
+        """One turn on a worker thread. Bind session ContextVars; never the gateway loop."""
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        task_id = pending["task_id"]
+        context_id = pending["context_id"]
+        event = pending.get("event")
+        src = getattr(event, "source", None)
+        tokens = set_session_vars(
+            platform="a2a", source="a2a",
+            chat_id=str(getattr(src, "chat_id", "") or context_id),
+            chat_type=str(getattr(src, "chat_type", "") or "dm"),
+            chat_name=str(getattr(src, "chat_name", "") or ""),
+            user_id=str(getattr(src, "user_id", "") or pending.get("peer") or ""),
+            user_name=str(getattr(src, "user_name", "") or pending.get("peer") or ""),
+            session_key=str(context_id),
+            message_id=str(getattr(event, "message_id", "") or task_id),
+            async_delivery=True,
+        )
+        try:
+            with self._context_lock(context_id):
+                reply = self._execute_a2a_turn(pending)
+                if reply is not None:
+                    self._resolve_oldest_for_context(context_id, protocol.STATE_COMPLETED, reply)
+        except Exception as e:
+            msg = security.redact_outbound(f"Dispatch failed: {e}")
+            self._resolve_task(task_id, protocol.STATE_FAILED, msg)
+        finally:
+            clear_session_vars(tokens)
+
+    def _execute_a2a_turn(self, pending: dict) -> Optional[str]:
+        """Hookable turn body. Tests inject ``_sync_conversation``; live uses the bound handler."""
+        hook = self._sync_conversation
+        if callable(hook):
+            return hook(pending)
+        event = pending.get("event")
+        if event is None:
+            raise RuntimeError("Agent gateway not ready to accept A2A tasks.")
+        # Instance override (tests): run that coroutine on this thread, not the gateway loop.
+        own_handle = vars(self).get("handle_message")
+        if callable(own_handle):
+            result = own_handle(event)
+            if inspect.iscoroutine(result):
+                asyncio.run(result)
+            return None
+        handler = self._message_handler
+        if not callable(handler):
+            raise RuntimeError("Agent gateway not ready to accept A2A tasks.")
+        asyncio.run(self._run_bound_handler(event, handler))
+        return None
+
+    async def _run_bound_handler(self, event: MessageEvent, handler) -> None:
+        response = await handler(event)
+        text, _ttl = self._unwrap_ephemeral(response)
+        if text:
+            await self.send(event.source.chat_id, text, metadata={"notify": True})
 
     def _finalize_when_reply_arrives(self, pending: dict) -> None:
         """Bind terminal task state to the reply future, never an RPC timer."""
