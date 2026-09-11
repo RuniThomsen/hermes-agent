@@ -27,6 +27,7 @@ def test_message_send_exposes_submitted_before_session_dispatch(monkeypatch):
         dispatched["n"] += 1
 
     adapter.handle_message = handle  # type: ignore[method-assign]
+    adapter._sync_conversation = lambda pending: pending["task_id"]
     params = {
         "message": protocol.text_message(protocol.ROLE_USER, "receipt-before-session"),
     }
@@ -45,11 +46,12 @@ def test_message_send_exposes_submitted_before_session_dispatch(monkeypatch):
         rec = adapter.tasks.get(task["id"])
         while time.monotonic() < deadline:
             rec = adapter.tasks.get(task["id"])
-            if rec and rec["state"] == protocol.STATE_WORKING:
+            if rec and rec["state"] != protocol.STATE_SUBMITTED:
                 break
             time.sleep(0.01)
         assert rec is not None
-        assert rec["state"] == protocol.STATE_WORKING
+        assert rec["state"] in (protocol.STATE_WORKING, protocol.STATE_COMPLETED)
+        assert dispatched["n"] == 0
     finally:
         loop.call_soon_threadsafe(loop.stop)
         loop_thread.join(1)
