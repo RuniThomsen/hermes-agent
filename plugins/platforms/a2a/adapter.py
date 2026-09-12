@@ -760,7 +760,8 @@ class A2AAdapter(BasePlatformAdapter):
         callback_url = self.tasks.pop_push_url(task_id)
         if not callback_url:
             return
-        if not security.is_safe_callback_url(callback_url, localhost_mode=self._security_context.localhost_only()):
+        if not security.is_safe_callback_url(
+                callback_url, localhost_mode=self._security_context.allow_loopback_callbacks()):
             return fail("blocked — unsafe callback URL: %s", callback_url)
         payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
         headers = {"Content-Type": "application/json"}
