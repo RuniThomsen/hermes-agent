@@ -107,6 +107,7 @@ def register(ctx) -> None:
     # 2) Inbound platform adapter.
     try:
         from .adapter import A2AAdapter
+        from .tools import _standalone_send
         ctx.register_platform(
             name="a2a",
             label="A2A",
@@ -121,6 +122,7 @@ def register(ctx) -> None:
             allowed_users_env="A2A_ALLOWED_USERS",
             allow_all_env="A2A_ALLOW_ALL_USERS",
             cron_deliver_env_var="A2A_HOME_CHANNEL",
+            standalone_sender_fn=_standalone_send,
             allow_update_command=False,
             platform_hint=(
                 "You are reachable over the A2A (Agent-to-Agent) protocol. "
