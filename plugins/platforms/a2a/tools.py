@@ -23,11 +23,13 @@ v1.0 JSON-RPC ``message/send`` method; replies from v0.3 peers still parse.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Optional, TypedDict
 
 from . import protocol, security
@@ -72,6 +74,105 @@ def _auth_header(auth: dict) -> dict:
     if auth and auth.get("type") == "bearer" and auth.get("token"):
         return {"Authorization": f"Bearer {auth['token']}"}
     return {}
+
+
+def _configured_peers() -> dict:
+    peers = _load_config().get("a2a_agents") or {}
+    return peers if isinstance(peers, dict) else {}
+
+
+def _hydrate_auth(auth: dict) -> dict:
+    """Fill ``token`` from ``token_file``. ``_auth_header`` is anonymous without ``token``."""
+    out = dict(auth or {})
+    if out.get("token"):
+        out.setdefault("type", "bearer")
+        return out
+    path = str(out.get("token_file") or "").strip()
+    if not path:
+        return out
+    try:
+        token = Path(path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError:
+        return out
+    if token:
+        out["token"] = token
+        out["type"] = out.get("type") or "bearer"
+    return out
+
+
+def _loopback_direct_url(url: str) -> str:
+    """Append ``direct=1`` when missing. Callers opt in via extra.local_first_send."""
+    u = (url or "").strip()
+    if not u or "direct=1" in u:
+        return u
+    if "?" in u:
+        return u + "&direct=1"
+    return u.rstrip("/") + "/?direct=1"
+
+
+def _standalone_peer(pconfig) -> dict:
+    extra = getattr(pconfig, "extra", {}) or {}
+    agents = _configured_peers()
+    name = str(extra.get("cron_peer") or extra.get("local_peer") or "").strip()
+    if not name and len(agents) == 1:
+        name = next(iter(agents))
+    entry = agents.get(name) if name else {}
+    entry = entry if isinstance(entry, dict) else {}
+    url = (
+        str(extra.get("local_peer_url") or extra.get("cron_peer_url") or "").strip()
+        or str(entry.get("url") or "").strip()
+    )
+    if extra.get("local_first_send") or extra.get("direct"):
+        url = _loopback_direct_url(url)
+    auth = _hydrate_auth(entry.get("auth") or {})
+    token_file = str(
+        extra.get("cron_peer_token_file") or extra.get("local_peer_token_file") or auth.get("token_file") or ""
+    ).strip()
+    if not auth.get("token") and token_file:
+        auth = _hydrate_auth({**auth, "token_file": token_file, "type": "bearer"})
+    timeout = int(entry.get("timeout") or extra.get("cron_peer_timeout") or 30)
+    return {"url": url, "auth": auth, "timeout": timeout, "capabilities": []}
+
+
+def _standalone_send_sync(pconfig, chat_id: str, message: str) -> dict:
+    """Out-of-process A2A cron delivery. Live ``adapter.send`` only resolves inbound waiters."""
+    peer = _standalone_peer(pconfig)
+    base_url = peer.get("url") or ""
+    headers = _auth_header(peer.get("auth") or {})
+    if not base_url:
+        return {"error": "a2a standalone send: no local_peer_url"}
+    if not headers.get("Authorization"):
+        return {"error": "a2a standalone send: no Bearer (token_file missing or unread); anonymous loopback is not named-peer identity"}
+    ctx = chat_id or protocol.new_context_id()
+    safe_message = security.redact_outbound(message)
+    rpc_id = protocol.new_task_id()
+    rpc_body = {
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "method": "SendMessage",
+        "params": {
+            "message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx),
+            "configuration": {"blocking": False, "returnImmediately": True},
+        },
+    }
+    try:
+        resp = _http_post_json(base_url, rpc_body, headers, int(peer.get("timeout") or 30))
+    except Exception as e:
+        return {"error": f"a2a standalone send failed: {e}"}
+    if isinstance(resp, dict) and resp.get("error"):
+        err = resp["error"]
+        return {"error": f"a2a standalone send: {err.get('message', err) if isinstance(err, dict) else err}"}
+    result = resp.get("result") if isinstance(resp, dict) else None
+    payload = protocol.unwrap_send_message_response(result) if result is not None else result
+    message_id = rpc_id
+    if isinstance(payload, dict):
+        message_id = str(payload.get("id") or payload.get("taskId") or rpc_id)
+    return {"success": True, "platform": "a2a", "chat_id": ctx, "message_id": message_id}
+
+
+async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id=None, media_files=None, force_document=False) -> dict:
+    del thread_id, media_files, force_document
+    return await asyncio.to_thread(_standalone_send_sync, pconfig, chat_id, message)
 
 
 # --------------------------------------------------------------------------
