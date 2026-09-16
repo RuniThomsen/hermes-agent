@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import json
 import logging
+import stat
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Optional, TypedDict
 
 from . import protocol, security
@@ -50,25 +52,67 @@ def _load_config() -> dict:
         return {}
 
 
-def _resolve_peer(agent: str) -> Optional[dict]:
-    """Resolve a peer name to {url, auth, timeout, capabilities}, or treat ``agent`` as a URL."""
-    if agent.startswith("http://") or agent.startswith("https://"):
-        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": []}
-    cfg = _load_config()
-    peers = cfg.get("a2a_agents") or {}
-    entry = peers.get(agent)
-    if not entry:
-        return None
+def _hydrate_auth(auth: dict) -> dict:
+    """Fill ``token`` from ``token_file``. ``_auth_header`` is anonymous without ``token``."""
+    out = dict(auth or {})
+    if out.get("token"):
+        if not out.get("type"):
+            out["type"] = "bearer"
+        return out
+    path = str(out.get("token_file") or "").strip()
+    if not path:
+        return out
+    p = Path(path).expanduser()
+    try:
+        if p.is_symlink() or not p.is_file():
+            return out
+        mode = p.stat().st_mode
+        if mode & (stat.S_IRWXG | stat.S_IRWXO):
+            return out
+        token = p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return out
+    if token and all(not ch.isspace() for ch in token) and 8 <= len(token) <= 4096:
+        out["token"] = token
+        out["type"] = out.get("type") or "bearer"
+    return out
+
+
+def _peer_from_entry(entry: dict, *, url: str | None = None) -> dict:
     return {
-        "url": entry.get("url", ""),
-        "auth": entry.get("auth", {}) or {},
+        "url": url if url is not None else entry.get("url", ""),
+        "auth": _hydrate_auth(entry.get("auth", {}) or {}),
         "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
         "capabilities": entry.get("capabilities", []) or [],
         "tenant": entry.get("tenant", ""),
     }
 
 
+def _resolve_peer(agent: str) -> Optional[dict]:
+    """Resolve a peer name to {url, auth, timeout, capabilities}, or treat ``agent`` as a URL.
+
+    A direct http(s) URL that matches a configured peer (including ``?direct=1``)
+    reuses that peer's bearer so the direct flag is not an anonymous send.
+    """
+    cfg = _load_config()
+    peers = cfg.get("a2a_agents") or {}
+    if agent.startswith("http://") or agent.startswith("https://"):
+        want = agent.rstrip("/")
+        for entry in peers.values():
+            if not isinstance(entry, dict):
+                continue
+            configured = str(entry.get("url") or "").strip()
+            if configured and configured.rstrip("/") == want:
+                return _peer_from_entry(entry, url=configured)
+        return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": []}
+    entry = peers.get(agent)
+    if not entry:
+        return None
+    return _peer_from_entry(entry)
+
+
 def _auth_header(auth: dict) -> dict:
+    auth = _hydrate_auth(auth)
     if auth and auth.get("type") == "bearer" and auth.get("token"):
         return {"Authorization": f"Bearer {auth['token']}"}
     return {}
