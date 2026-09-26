@@ -102,6 +102,9 @@ def _fire_post_api_request_hook(
 def _relay_thinking(agent: Any, content: str) -> None:
     """Relay the model's text to the progress callback: subagents send the first line to
     the parent display; any agent with a structured callback gets ``reasoning.available``."""
+    from agent.protected_output import protected_turn
+    if protected_turn(agent):
+        return
     _think_text = _REASONING_TAG_RE.sub('', content.strip()).strip()
     first_line = _think_text.split('\n')[0][:80] if _think_text else ""
     if first_line and getattr(agent, '_delegate_depth', 0) > 0:

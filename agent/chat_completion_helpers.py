@@ -1537,7 +1537,9 @@ def _assistant_reasoning_text(agent, assistant_message) -> Optional[str]:
     # streaming is caught by the CLI post-response fallback.
     if reasoning_text and agent.reasoning_callback and not agent.stream_delta_callback and not agent._stream_callback:
         with contextlib.suppress(Exception):
-            agent.reasoning_callback(reasoning_text)
+            from agent.protected_output import protected_turn
+            if not protected_turn(agent):
+                agent.reasoning_callback(reasoning_text)
     return _sanitize_surrogates(reasoning_text) if reasoning_text else reasoning_text
 
 
@@ -2837,7 +2839,8 @@ class _StreamingCall(StreamingWaitMonitor):
         reasoning tags inside it must still reach the display: route through
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
-        if self.agent.stream_delta_callback:
+        from agent.protected_output import protected_turn
+        if self.agent.stream_delta_callback and not protected_turn(self.agent):
             self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
 
     def _new_diag(self) -> dict:

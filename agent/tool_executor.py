@@ -957,6 +957,9 @@ def _run_sequential_tool_execution_middleware(
 
 def _safe_callback(callback, label: str, *args, **kwargs) -> None:
     """Invoke a UI/bridge callback if set; a failing callback is logged, never fatal."""
+    from agent.protected_output import protected_turn
+    if protected_turn():
+        return
     if not callback:
         return
     try:
@@ -1071,20 +1074,23 @@ def _commit_tool_result(
     _status_suffix = " (error)" if is_error else ""
     agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
+    from agent.protected_output import protected_turn
+    protected = protected_turn(agent)
     persisted_result = function_result
-    if _is_multimodal_tool_result(persisted_result):
-        persisted_result = _persist_multimodal_text_parts(
-            persisted_result, function_name, tool_call_id, get_active_env(effective_task_id), budget,
-        )
-    else:
-        persisted_result = maybe_persist_tool_result(
-            content=persisted_result,
-            tool_name=function_name,
-            tool_use_id=tool_call_id,
-            env=get_active_env(effective_task_id),
-            config=budget,
-        )
-    _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
+    if not protected:
+        if _is_multimodal_tool_result(persisted_result):
+            persisted_result = _persist_multimodal_text_parts(
+                persisted_result, function_name, tool_call_id, get_active_env(effective_task_id), budget,
+            )
+        else:
+            persisted_result = maybe_persist_tool_result(
+                content=persisted_result,
+                tool_name=function_name,
+                tool_use_id=tool_call_id,
+                env=get_active_env(effective_task_id),
+                config=budget,
+            )
+        _record_persisted_path_for_stub(agent, tool_call_id, persisted_result)
 
     subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
     if subdir_hints:
@@ -1101,7 +1107,7 @@ def _commit_tool_result(
     # Prepare presentation data before the append. The emitting completion callback
     # stays below the durability fence; raw tool/model content remains unchanged.
     prepare_metadata = getattr(agent, "tool_result_metadata_callback", None)
-    if not blocked and prepare_metadata:
+    if not protected and not blocked and prepare_metadata:
         try:
             display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
             metadata = prepare_metadata(tool_call_id, function_name, display_args, function_result)
@@ -1158,12 +1164,15 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     steer marker is never truncated/discarded when enforcement replaces a result."""
     if num_tools <= 0:
         return
-    enforce_turn_budget(messages[-num_tools:], env=get_active_env(effective_task_id), config=budget)
+    from agent.protected_output import protected_turn
+    if not protected_turn(agent):
+        enforce_turn_budget(messages[-num_tools:], env=get_active_env(effective_task_id), config=budget)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 
 def _tool_progress_enabled(agent) -> bool:
-    return not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off"
+    from agent.protected_output import protected_turn
+    return not protected_turn(agent) and not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off"
 
 
 def _preview(text: str, limit: int) -> str:

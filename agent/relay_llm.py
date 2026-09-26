@@ -61,6 +61,9 @@ class _ManagedAttempt:
         *, name: str, model_name: str,
     ) -> "_ManagedAttempt | None":
         """Return the managed attempt for ``session_id`` (None: the inherited turn's), or None to run unmanaged."""
+        from agent.protected_output import protected_turn
+        if protected_turn():
+            return None
         if session_id is None:
             session_id = _current_session_id()
         if not session_id:

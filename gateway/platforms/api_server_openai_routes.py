@@ -727,7 +727,9 @@ class OpenAICompatRoutesMixin:
             return err
         result, usage = outcome
         presentation_muted = result.get("_notification_presentation_suppressed") is True
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response = result.get("final_response") or ""
+        if "protected_output" not in result:
+            final_response = _resolve_media_to_data_urls(final_response)
         completed, is_partial, is_failed, err_msg = _result_flags(result)
         if err_msg:
             err_msg = _redact_api_error_text(err_msg)
@@ -740,7 +742,7 @@ class OpenAICompatRoutesMixin:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
         # Hard fail (no usable text AND a real failure) -> 502 OpenAI error envelope so SDK
         # clients raise instead of rendering the failure string as message.content.
-        if not final_response and (is_failed or is_partial):
+        if not final_response and (is_failed or is_partial) and "protected_output" not in result:
             err_body = _openai_error(
                 "" if presentation_muted else (err_msg or "Agent run did not produce a response."), err_type="server_error",
                 code="agent_incomplete")
@@ -1092,8 +1094,10 @@ class OpenAICompatRoutesMixin:
         if err is not None:
             return err
         result, usage = outcome
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
-        if not final_response:
+        final_response = result.get("final_response", "")
+        if "protected_output" not in result:
+            final_response = _resolve_media_to_data_urls(final_response)
+        if not final_response and "protected_output" not in result:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
@@ -1243,7 +1247,8 @@ class OpenAICompatRoutesMixin:
                     "id": f"fco_{uuid.uuid4().hex[:24]}", "type": "function_call_output",
                     "status": "completed", "call_id": msg.get("tool_call_id", ""),
                     "output": msg.get("content", "")})
-        final = result.get("final_response", "") or _redact_api_error_text(
-            result.get("error", "(No response generated)"))
+        final = result.get("final_response", "")
+        if not final and "protected_output" not in result:
+            final = _redact_api_error_text(result.get("error", "(No response generated)"))
         items.append(_message_item(final))
         return items

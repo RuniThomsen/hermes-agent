@@ -231,6 +231,11 @@ class CompressionFacadeMixin:
         summary-failure cooldown after an auto-compress abort. Auto-compress callers use the default
         ``force=False``. See #100661.
         """
+        from agent.protected_output import protected_turn
+        if protected_turn(self):
+            # Compression owns a separate durable checkpoint pipeline. It cannot
+            # consume the unadmitted transcript; overflow follows the normal stop path.
+            return messages, system_message
         # Per-attempt timeout signal for turn-start preflight and in-loop consumers: a stalled
         # compression must not be mistaken for a structural no-op. Thread-local + per-agent lock.
         # A stalled compression must not be mistaken for a structural no-op and followed by the oversized

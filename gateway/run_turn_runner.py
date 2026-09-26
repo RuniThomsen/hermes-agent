@@ -1737,7 +1737,7 @@ class TurnRunner:
         ctx = self._ctx
         # Canonicalize a model-emitted computer-use screenshot path at the common result boundary so
         # the streaming finalizer and the non-streaming delivery path see the same response.
-        if isinstance(result, dict) and isinstance(result.get("final_response"), str):
+        if isinstance(result, dict) and "protected_output" not in result and isinstance(result.get("final_response"), str):
             result["final_response"] = repair_explicit_computer_use_media_paths(
                 result["final_response"], result.get("messages", []), history_offset=len(agent_history),
             )
@@ -1985,6 +1985,10 @@ class TurnRunner:
             "history_offset": history_offset, "compacted_in_place": compacted_in_place, "session_id": effective_session_id,
             **usage,
         }
+        if "protected_output" in result:
+            # The agent has committed exactly this text. Host normalization, media
+            # inference and footer additions would invalidate that admission.
+            return {**result, **common, "agent_persisted": result.get("agent_persisted", True)}
         if not final_response:
             final_response = _normalize_empty_agent_response(result, final_response or "", history_len=len(agent_history))
             final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)

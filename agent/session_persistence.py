@@ -355,11 +355,12 @@ class SessionPersistenceMixin:
         with _persist_lock(self):
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
-            self._flush_messages_to_session_db(messages, conversation_history)
+            persisted = self._flush_messages_to_session_db(messages, conversation_history)
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return persisted is True if self._session_db is not None else False
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Pop empty-response retry scaffolding from the tail, then (only if any was present) rewind the
@@ -387,6 +388,9 @@ class SessionPersistenceMixin:
 
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: Optional[List[Dict]] = None):
         """Serialize direct and turn-boundary session flushes per agent."""
+        from agent.protected_output import may_persist
+        if not may_persist(self, messages):
+            return True
         with _persist_lock(self):
             return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
 
@@ -438,6 +442,9 @@ class SessionPersistenceMixin:
 
     def _save_trajectory(self, messages: List[Dict[str, Any]], user_query: str, completed: bool):
         """Save conversation trajectory to JSONL file."""
+        from agent.protected_output import may_persist
+        if not may_persist(self, messages):
+            return
         if not self.save_trajectories:
             return
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)

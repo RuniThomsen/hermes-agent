@@ -1687,6 +1687,8 @@ DEFAULT_CONFIG = {
     "platform_hints": {},
     # Plugin system. `enabled`/`disabled` lists are written by `hermes plugins enable|disable` and
     # deliberately omitted here so an empty default never clobbers a user allow-list.
+    # None disables the contract; a configured policy is mandatory, never advisory.
+    "protected_output": None,
     "plugins": {
         # Deadline (seconds) for one plugin Git clone, fetch or checkout. Slow repositories may
         # need more time; each network operation is capped at one hour.

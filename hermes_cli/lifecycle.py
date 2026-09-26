@@ -7,6 +7,15 @@ from typing import Any, List
 
 logger = logging.getLogger(__name__)
 
+# Only raw-output observers are withheld. Governing hooks (including unknown
+# extension hooks) must still traverse the real dispatcher and keep their verdicts.
+_PROTECTED_RAW_OBSERVER_HOOKS = frozenset({
+    "post_tool_call", "post_llm_call", "pre_api_request", "post_api_request",
+    "api_request_error", "pre_auxiliary_call", "post_auxiliary_call",
+    "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
+    "on_room_member_activity", "subagent_stop", "on_session_end",
+})
+
 
 def _observe(hook_name: str, **kwargs: Any) -> None:
     try:
@@ -25,14 +34,24 @@ def _plugin_hooks(hook_name: str, **kwargs: Any) -> List[Any]:
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Notify first-party observers, then invoke compatibility plugin hooks."""
-    _observe(hook_name, **kwargs)
+    from agent.protected_output import protected_turn
+    protected = protected_turn()
+    if protected and hook_name in _PROTECTED_RAW_OBSERVER_HOOKS:
+        return []
+    if not protected:
+        _observe(hook_name, **kwargs)
     return _plugin_hooks(hook_name, **kwargs)
 
 
 async def ainvoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """:func:`invoke_hook` for callers on an event loop: same observers-then-plugins
     composition, with ``async def`` plugin callbacks awaited on that loop."""
-    _observe(hook_name, **kwargs)
+    from agent.protected_output import protected_turn
+    protected = protected_turn()
+    if protected and hook_name in _PROTECTED_RAW_OBSERVER_HOOKS:
+        return []
+    if not protected:
+        _observe(hook_name, **kwargs)
     from hermes_cli import plugins
 
     return await plugins.ainvoke_hook(hook_name, **kwargs)

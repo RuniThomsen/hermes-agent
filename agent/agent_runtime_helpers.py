@@ -1384,6 +1384,9 @@ def dump_api_request_debug(
     agent, api_kwargs: Dict[str, Any], *, reason: str, error: Optional[Exception] = None
 ) -> Optional[Path]:
     """Dump the request body from api_kwargs (minus transport keys) for debugging provider 4xx failures."""
+    from agent.protected_output import protected_turn
+    if protected_turn(agent):
+        return None
     try:
         body = {k: v for k, v in copy.deepcopy(api_kwargs).items() if v is not None and k != "timeout"}
         api_key = None

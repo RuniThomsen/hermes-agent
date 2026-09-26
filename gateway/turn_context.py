@@ -83,6 +83,7 @@ class TurnContext:
     _status_adapter: Any = None
     _status_chat_id: Any = None
     _status_thread_metadata: Optional[dict] = None
+    _protected_output_binding: Any = None
     # bound TurnRunner callbacks read via ctx
     progress_callback: Optional[Callable] = None
     voice_ack_callback: Optional[Callable] = None

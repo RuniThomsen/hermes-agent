@@ -8,6 +8,7 @@ import logging
 import sys
 
 from agent.session_activity import ActivityProvenance
+from agent.protected_output import protected_turn
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
@@ -19,6 +20,8 @@ class StatusOutputMixin:
     def _safe_print(self, *args, diagnostic: bool = False, **kwargs):
         """Print that swallows broken pipes / closed stdout (headless stdout can vanish mid-session);
         routes through ``self._print_fn`` so the CLI can inject an ANSI-aware renderer."""
+        if protected_turn(self):
+            return
         if getattr(self, "_mute_notification_reply", False):
             return
         if diagnostic and not self._warning_presentation_enabled():
@@ -63,6 +66,8 @@ class StatusOutputMixin:
 
     def _call_callback(self, name: str, *args, origin: str) -> None:
         """Invoke ``self.<name>(*args)`` if set, swallowing errors — a driver callback must never break the loop."""
+        if protected_turn(self):
+            return
         cb = getattr(self, name, None)
         if cb:
             try:

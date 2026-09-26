@@ -55,6 +55,7 @@ def run_tool_round(
     Hermes; a failed canonical append ends the turn rather than running tools from
     process-only state."""
     from agent.conversation_loop import _invalid_tool_name_error_content
+    from agent.protected_output import protected_turn
 
     def _verdict(action: str, result: Optional[Dict[str, Any]] = None) -> ToolRoundVerdict:
         return ToolRoundVerdict(
@@ -147,7 +148,7 @@ def run_tool_round(
 
     # Flush open streaming boxes before tools so early content doesn't wrap tool feed
     # lines. Display callback only — TTS (_stream_callback) must NOT receive None (EOS).
-    if agent.stream_delta_callback:
+    if agent.stream_delta_callback and not protected_turn(agent):
         with suppress(Exception):
             agent.stream_delta_callback(None)
 
@@ -171,7 +172,7 @@ def run_tool_round(
         # alive, so SSE/TUI clients see the explanation.
         if final_response:
             agent._safe_print(f"\n{final_response}\n")
-            if agent.stream_delta_callback:
+            if agent.stream_delta_callback and not protected_turn(agent):
                 with suppress(Exception):
                     agent.stream_delta_callback(final_response)
                     agent.stream_delta_callback(None)

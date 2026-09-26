@@ -1203,6 +1203,14 @@ def _apply_context_engine_selection(
 ) -> List[Dict[str, Any]]:
     """Run the optional per-turn ``ContextEngine.select_context()`` hook, fail-open: any
     exception or invalid return yields ``api_messages`` unchanged; history is never mutated."""
+    from agent.protected_output import protected_turn
+    if protected_turn(agent):
+        current_user = getattr(agent, '_persist_user_message_idx', None)
+        if not isinstance(current_user, int) or any(
+            m.get('role') in ('assistant', 'tool')
+            for m in (conversation_messages or [])[current_user + 1:]
+        ):
+            return api_messages
     engine = getattr(agent, "context_compressor", None)
     if not _engine_overrides_hook(engine, "select_context"):
         return api_messages
@@ -1629,9 +1637,18 @@ def run_conversation(
 
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
-    with native_turn_images(user_message):
-        result = _run_conversation_turn(
-            agent,
+    from agent.protected_output import output_scope, run_output_turn, settle_output, settlement_failure
+    with output_scope(agent) as binding, native_turn_images(user_message):
+        stored_user_message = None
+        if binding is not None:
+            from copy import deepcopy
+            from agent.turn_context import _stage_turn_user_message
+            stored_user_message = deepcopy(_stage_turn_user_message(
+                agent, user_message, persist_user_message, persist_user_timestamp,
+                persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
+            )[0])
+        result = run_output_turn(
+            binding, _run_conversation_turn, agent,
             user_message,
             system_message=system_message,
             conversation_history=conversation_history,
@@ -1645,8 +1662,17 @@ def run_conversation(
             moa_config=moa_config,
             turn_author=turn_author,
         )
+        if binding is not None:
+            try:
+                result = settle_output(agent, binding, result, conversation_history,
+                                       persist_user_message if persist_user_message is not None else user_message,
+                                       stored_user_message=stored_user_message)
+            except Exception:
+                result = settlement_failure(agent, binding, conversation_history,
+                                            persist_user_message if persist_user_message is not None else user_message)
     result = export_current_turn_boundary(agent, result, user_message)
-    _close_durable_failed_turn(agent, result)
+    if binding is None:
+        _close_durable_failed_turn(agent, result)
     return result
 
 

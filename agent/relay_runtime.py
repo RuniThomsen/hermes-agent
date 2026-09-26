@@ -1186,6 +1186,9 @@ def current_turn() -> RelayTurnContext | None:
 
 def relay_instrumentation_enabled() -> bool:
     """Return whether this inherited turn may create Relay instrumentation."""
+    from agent.protected_output import protected_turn
+    if protected_turn():
+        return False
     turn = current_turn()
     return turn is None or (turn.relay_enabled and not turn.closed)
 

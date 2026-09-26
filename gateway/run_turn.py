@@ -15,6 +15,7 @@ import os
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
@@ -1526,6 +1527,8 @@ class GatewayTurnMixin:
             _sanitize_gateway_final_response, _should_clear_resume_pending_after_turn,
         )
         response = agent_result.get("final_response") or ""
+        if "protected_output" in agent_result:
+            return response, not bool(response), agent_result.get("messages", [])
         # Hidden-reasoning-only retry exhaustion: the loop's sentinel text doubles as final_response
         # and would be delivered verbatim (peer agents would ingest it as a completed turn).
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
@@ -1643,6 +1646,8 @@ class GatewayTurnMixin:
     def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds):
         """Runtime-metadata footer for the FINAL message of the turn; off by default
         (display.runtime_footer.enabled=false)."""
+        if "protected_output" in agent_result:
+            return ""
         from gateway.run import _load_gateway_config, _platform_config_key, _terminal_scope_cwd
         try:
             from gateway.runtime_footer import build_footer_line as _bfl
@@ -1730,6 +1735,8 @@ class GatewayTurnMixin:
 
         Context-overflow failures must NOT persist the user message (session would grow and
         reproduce the failure forever); transient failures (429/timeout/5xx) DO."""
+        if "protected_output" in agent_result:
+            return False, False, False
         from gateway.run import _is_gateway_hidden_reasoning_incomplete_turn
         # Save the full conversation to the transcript, including tool calls. This preserves the complete
         # agent loop (tool_calls, tool results, intermediate reasoning) so sessions can be resumed with full
@@ -3492,9 +3499,12 @@ class GatewayTurnMixin:
                 return agent.get_activity_summary()
         return {}
 
-    async def _run_agent_inactivity_warning(self, worker, source, _status_thread_metadata) -> None:
+    async def _run_agent_inactivity_warning(self, worker, turn_ctx: TurnContext) -> None:
         """Staged one-shot warning before the inactivity timeout escalates."""
         from gateway.run import _interim_metadata
+        if turn_ctx._protected_output_binding is not None:
+            return
+        source, _status_thread_metadata = turn_ctx.source, turn_ctx._status_thread_metadata
         _warn_adapter = self._delivery_adapter_for(source)
         if not _warn_adapter:
             return
@@ -3521,15 +3531,24 @@ class GatewayTurnMixin:
         _cur_tool = _activity.get("current_tool")
         _iter_n = _activity.get("api_call_count", 0)
         _iter_max = _activity.get("max_iterations", 0)
-        # Operator-facing log keeps the raw resolved value; only the user-facing lines hide the sentinel.
-        logger.error(
-            "Agent idle for %.0fs (timeout %.0fs) in session %s "
-            "| last_activity=%s | iteration=%s/%s | tool=%s",
-            _secs_ago, worker.agent_timeout, session_key, _last_desc, _iter_n, _iter_max,
-            _cur_tool or "none",
-        )
+        if turn_ctx._protected_output_binding is None:
+            logger.error(
+                "Agent idle for %.0fs (timeout %.0fs) in session %s "
+                "| last_activity=%s | iteration=%s/%s | tool=%s",
+                _secs_ago, worker.agent_timeout, session_key, _last_desc, _iter_n, _iter_max,
+                _cur_tool or "none",
+            )
         if _timed_out_agent:
             request_hard_interrupt(_timed_out_agent, _INTERRUPT_REASON_TIMEOUT, tool_reason=_INTERRUPT_TOOL_REASON_TIMEOUT)
+        if turn_ctx._protected_output_binding is not None:
+            from agent.protected_output import audit_output
+            audit_output(turn_ctx._protected_output_binding, 'suppress', 'timeout', '')
+            return {
+                'final_response': '', 'messages': [], 'api_calls': _iter_n,
+                'tools': [], 'history_offset': 0, 'failed': True,
+                'failure_reason': 'protected_output_timeout', 'protected_output': 'suppress',
+                'agent_persisted': False,
+            }
         _timeout_mins = int(worker.agent_timeout // 60) or 1
         _iter_progress = format_iteration_progress(_iter_n, _iter_max)
         _diag_lines = [
@@ -3581,7 +3600,7 @@ class GatewayTurnMixin:
                 _idle_secs = self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0)
                 if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
                     _warning_fired = True
-                    await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
+                    await self._run_agent_inactivity_warning(worker, turn_ctx)
                 if _idle_secs >= worker.agent_timeout:
                     threading.Thread(
                         target=_abandon_timed_out_gateway_turn,
@@ -3720,7 +3739,7 @@ class GatewayTurnMixin:
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
-        if self._is_intentional_silence(_delivery_result, first_response):
+        if "protected_output" not in _delivery_result and self._is_intentional_silence(_delivery_result, first_response):
             if is_machinery_display_kind(turn_ctx.persist_user_display_kind):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
@@ -4137,6 +4156,18 @@ class GatewayTurnMixin:
         turn_ctx._status_adapter = self._delivery_adapter_for(source)
         turn_ctx._status_chat_id = source.chat_id
         turn_ctx._status_thread_metadata = _status_thread_metadata
+        # Snapshot the routed turn's policy before the executor creates an agent.
+        # Event-loop notices cannot infer protection from agent_holder.
+        from agent.protected_output import bind_output, unavailable_binding
+        identity = SimpleNamespace(
+            session_id=turn_ctx.session_id, platform=str(getattr(source.platform, 'value', source.platform)),
+            _chat_id=source.chat_id, _thread_id=source.thread_id, _session_db=None,
+        )
+        try:
+            with self._profile_scope_for_source(source):
+                turn_ctx._protected_output_binding = bind_output(identity)
+        except Exception:
+            turn_ctx._protected_output_binding = unavailable_binding(identity)
         return _status_thread_metadata
 
     async def _run_agent_notify_long_running(
@@ -4149,6 +4180,8 @@ class GatewayTurnMixin:
         Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
         long_running_notifications=off disables)."""
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
+        if turn_ctx._protected_output_binding is not None:
+            return
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)

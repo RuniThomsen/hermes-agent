@@ -122,7 +122,11 @@ def test_direct_warning_delivery_keeps_failure_state(tmp_path, monkeypatch, enab
     gateway._home_channel_transports = lambda: [(Platform.SLACK, None, SimpleNamespace(chat_id="chat"), adapter)]
     gateway._send_home_channel_message = AsyncMock()
     asyncio.run(gateway._hmwa_hygiene_notify(source, {}, "Compression failed", "failure"))
-    asyncio.run(gateway._run_agent_inactivity_warning(SimpleNamespace(agent_warning=60, agent_timeout=120), source, {}))
+    from gateway.turn_context import TurnContext
+    asyncio.run(gateway._run_agent_inactivity_warning(
+        SimpleNamespace(agent_warning=60, agent_timeout=120),
+        TurnContext(source=source, _status_thread_metadata={}),
+    ))
     asyncio.run(gateway._send_session_db_warning_notifications())
     assert len(adapter.sent) == (2 if enabled else 0)
     assert gateway._send_home_channel_message.await_count == int(enabled)

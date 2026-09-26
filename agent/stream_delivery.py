@@ -8,6 +8,7 @@ import re
 import threading
 from typing import Any, Dict, List
 
+from agent.protected_output import protected_turn
 from agent.memory_manager import sanitize_context
 from agent.message_content import flatten_message_text
 from agent.history_commentary import visible_commentary
@@ -32,11 +33,15 @@ class StreamDeliveryMixin:
 
     def _deliver_to_stream_callbacks(self, text: str) -> bool:
         """Send ``text`` to the display + TTS delta callbacks; True if at least one accepted it."""
+        if protected_turn(self):
+            return False
         results = [self._call_quietly(cb, text) for cb in (self.stream_delta_callback, self._stream_callback)]
         return any(results)
 
     def _enqueue_stream_hook(self, event: str, *, label: str | None = None, **fields: Any) -> None:
         """Best-effort plugin stream hook enqueue; never raises into the stream path."""
+        if protected_turn(self):
+            return
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -163,6 +168,8 @@ class StreamDeliveryMixin:
 
     def _deliver_interim(self, visible: str, *, already_streamed: bool, record: List[str]) -> None:
         """Hand ``visible`` to ``interim_assistant_callback`` and mark ``record`` delivered; swallows callback errors."""
+        if protected_turn(self):
+            return
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None:
             return
@@ -286,6 +293,8 @@ class StreamDeliveryMixin:
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
         # A superseded stream must not interleave its tokens alongside the retry that replaced it.
+        if protected_turn(self):
+            return
         if self._stream_writer_superseded():
             # See #65991.
             self._note_dropped_stream_writer("_fire_stream_delta")
@@ -318,6 +327,8 @@ class StreamDeliveryMixin:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered; superseded writers are fenced like content deltas."""
+        if protected_turn(self):
+            return
         if self._stream_writer_superseded():
             # Single-writer guard (#65991): fence out a superseded stream's reasoning deltas the same way as
             # content deltas.
@@ -341,10 +352,13 @@ class StreamDeliveryMixin:
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify the display layer that the model is generating tool call arguments (spinner for large payloads)."""
-        self._call_quietly(self.tool_gen_callback, tool_name)
+        if not protected_turn(self):
+            self._call_quietly(self.tool_gen_callback, tool_name)
 
     def _has_stream_consumers(self) -> bool:
         """Return True if any streaming consumer is registered."""
+        if protected_turn(self):
+            return False
         try:
             from agent.plugin_stream_hooks import has_stream_observer_hooks
 

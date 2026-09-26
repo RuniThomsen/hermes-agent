@@ -126,6 +126,11 @@ def _install_session_record_factory() -> None:
 
     def _session_record_factory(*args, **kwargs):
         record = current_factory(*args, **kwargs)
+        from agent.protected_output import protected_turn
+        if protected_turn():
+            # Suppress before async queues/formatters retain a raw candidate or exception.
+            record.msg, record.args = "Protected turn diagnostic withheld", ()
+            record.exc_info = record.exc_text = record.stack_info = None
         sid = getattr(_session_context, "session_id", None)
         record.session_tag = f" [{sid}]" if sid else ""  # type: ignore[attr-defined]
         # QueueListener formats on its own thread, after the profile-scoped

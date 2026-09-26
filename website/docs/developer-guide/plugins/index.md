@@ -21,6 +21,7 @@ Hermes has several distinct pluggable interfaces — some use Python `register_*
 | A **gateway channel** (Discord/Telegram/IRC/Teams/etc.) | [Adding Platform Adapters](../adding-platform-adapters.md) |
 | A **memory backend** (Honcho/Mem0/Supermemory/etc.) | [Memory Provider Plugins](../memory-provider-plugin.md) |
 | A **context-compression engine** | [Context Engine Plugins](../context-engine-plugin.md) |
+| A mandatory **final-output policy** | [Protected output policies](../protected-output.md) |
 | An **image-generation backend** | [Image Generation Provider Plugins](../image-gen-provider-plugin.md) |
 | A **video-generation backend** | [Video Generation Provider Plugins](../video-gen-provider-plugin.md) |
 | A **web-search / extract backend** | [Web Search Provider Plugins](../web-search-provider-plugin.md) |

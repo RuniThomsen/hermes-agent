@@ -273,6 +273,9 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
 def _micro_compact_after_turn(agent, messages, final_response, logger) -> None:
     """Post-turn micro-compaction: absorb the oldest uncompacted exchange into the
     rolling summary before persist, amortizing compression across turns."""
+    from agent.protected_output import protected_turn
+    if protected_turn(agent):
+        return
     try:
         _compressor = getattr(agent, "context_compressor", None)
         # Strict `is True` + callable gates: plugin context engines and MagicMock
@@ -495,6 +498,7 @@ def finalize_turn(
 ):
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
+    from agent.protected_output import protected_turn
 
     final_response, _turn_exit_reason, preserved_verification_fallback = _resolve_budget_fallback(
         agent, final_response=final_response, api_call_count=api_call_count,
@@ -593,11 +597,12 @@ def finalize_turn(
     # ``None`` on turns that never reached a provider response — by contract.
     try:
         from agent.conversation_loop import _notify_context_engine_turn_complete
-        _notify_context_engine_turn_complete(
-            agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
-            turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
-            interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
-        )
+        if not protected_turn(agent):
+            _notify_context_engine_turn_complete(
+                agent, messages, usage=getattr(agent, "_last_turn_usage", None), logger=logger,
+                turn_id=turn_id, task_id=effective_task_id, api_call_count=api_call_count,
+                interrupted=interrupted, failed=failed, turn_exit_reason=_turn_exit_reason,
+            )
     except Exception as exc:
         logger.warning("on_turn_complete notification failed: %s", exc)
 
@@ -688,10 +693,11 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message, final_response=final_response,
-        interrupted=interrupted, messages=messages,
-    )
+    if not protected_turn(agent):
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message, final_response=final_response,
+            interrupted=interrupted, messages=messages,
+        )
 
     # Background memory/skill review runs AFTER delivery so it never competes with the
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
@@ -699,6 +705,7 @@ def finalize_turn(
     # clones the snapshot structurally so its sanitizers can't reach the live transcript.
     if (
         final_response
+        and not protected_turn(agent)
         and not interrupted
         and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
