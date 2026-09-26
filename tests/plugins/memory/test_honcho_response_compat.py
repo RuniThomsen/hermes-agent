@@ -12,8 +12,8 @@ from plugins.memory.honcho.client import _install_peer_response_compat
 
 
 LEGACY_PEER_RESPONSE = {
-    "id": "runi",
-    "workspace_id": "abel-cell-v1",
+    "id": "test-peer",
+    "workspace_id": "test-workspace",
     "created_at": "2026-08-01T00:00:00Z",
     "metadata": {},
     "configuration": {"observe_others": False},
@@ -46,7 +46,7 @@ def test_legacy_observe_others_is_accepted_only_on_peer_responses():
         assert compat_response is not None
 
         parsed = compat_response.model_validate(LEGACY_PEER_RESPONSE)
-        assert parsed.id == "runi"
+        assert parsed.id == "test-peer"
         assert "observe_others" not in parsed.configuration.model_dump()
         assert api_types.PeerResponse is compat_response
         assert peer_module.PeerResponse is compat_response
